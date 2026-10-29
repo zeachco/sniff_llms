@@ -48,11 +48,29 @@ added are rendered. If a conversation was still split (for example traffic
 captured before capture was running), select the later tab and press `m` to
 merge it into the one on its left.
 
+A **subagent generation** is deliberately *not* merged into its parent: it is a
+separate process with its own context and history. It gets its own tab, placed
+right after the parent's tabs and prefixed with `↳`, so parent and child stay
+one visual group without corrupting either transcript. Detection uses the
+parent's unfinished tool call named `subagent` / `spawn_agent` / `task` /
+`delegate`: the child request must carry a subagent profile prompt (or the
+request was missed, which leaves timing and the open call), and the child
+tool-call brief is matched against the parent's arguments when both bodies were
+captured. Grouping is bounded to the last 5 minutes of parent activity. To
+regroup tabs by hand, press `g` on the parent, select the child, then press `g`
+again: the child's subtree moves right after the parent's. `u` ungroups the
+selected tab; closing a parent reparents its children instead of
+dropping them. When a router backend leg wins a response id, request metadata
+from the mirrored client leg (including the declared thread id) is adopted
+without appending the stream twice.
+
 Keys: `Left/Right` switch chats, `Up/Down` scroll, `End` resumes following,
 `x` closes and forgets a chat, `m` merges the selected chat into the previous
-one as a continuation, `d` writes `~/chat-id-{id}.log`, `a` cycles the
-auto-clean rule, `r` renames the current chat (`Enter` saves, `Esc` cancels,
-blank clears), `R` asks a local model for a short name, and `q` quits.
+one as a continuation, `g` marks the selected tab as a group parent (press it
+again on the child to attach it), `u` ungroups it, `d` writes
+`~/chat-id-{id}.log`, `a` cycles the auto-clean rule, `r` renames the current
+chat (`Enter` saves, `Esc` cancels, blank clears), `R` asks a local model for a
+short name, and `q` quits.
 
 The left column is a timeline of the selected chat: one entry per generated
 run of **thinking**, **answer**, or **tool** call, in generation order. Each
@@ -61,9 +79,9 @@ it took to generate. The active entry is marked and bold. Turn boundaries are
 shown when a chat has more than one turn.
 
 The sticky statistics panel shows the name (when set), model, completion
-state, packet count, flow, declared thread id, token usage, tool-call count,
-turn count, and llama.cpp timing data when those fields are present in the
-streamed JSON.
+state, packet count, flow, declared thread id, parent id (for a grouped
+subagent), token usage, tool-call count, turn count, and llama.cpp timing data
+when those fields are present in the streamed JSON.
 Conversation tabs use the custom name when set, otherwise middle-elided IDs.
 A tab takes the color of the last generated thing: orange for a tool call, gray
 for thinking, white for an answer, and green before any output. The selected tab

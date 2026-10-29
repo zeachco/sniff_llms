@@ -167,6 +167,12 @@ struct Chat {
     /// Explicit thread identity declared by the client (session header or
     /// body field), when it sent one. Authoritative over content heuristics.
     thread: Option<String>,
+    /// First-turn id of the chat this one was spawned from, when it is a
+    /// subagent generation. Such chats are grouped under their parent tab
+    /// instead of being merged into its message history.
+    parent: Option<String>,
+    /// Last time a chunk arrived, used to bound subagent auto-grouping.
+    last_activity: Instant,
     turns: Vec<Turn>,
     scroll: u16,
     follow: bool,
@@ -185,6 +191,8 @@ impl Chat {
             backend: None,
             flow,
             thread,
+            parent: None,
+            last_activity: Instant::now(),
             turns: vec![Turn::new(id, request)],
             scroll: 0,
             follow: true,
@@ -215,6 +223,32 @@ impl Chat {
     }
     fn timings(&self) -> Option<&Value> {
         self.turns.iter().rev().find_map(|t| t.timings.as_ref())
+    }
+    /// Tool calls in progress that may have spawned subagent generations. The
+    /// turn must have finished asking for tools, and no later request may have
+    /// delivered a result for the call yet.
+    fn open_subagent_calls(&self) -> Vec<&ToolCall> {
+        // `None` means the turn is still streaming: a harness may execute a
+        // completed tool call before the finish chunk reaches the wire.
+        if !matches!(self.finish(), Some("tool_calls") | None) {
+            return Vec::new();
+        }
+        let resolved: HashSet<&str> = self
+            .last()
+            .request
+            .as_ref()
+            .and_then(|r| r.get("messages"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+            .filter_map(|m| m.get("tool_call_id").and_then(Value::as_str))
+            .collect();
+        self.last()
+            .tool_calls
+            .iter()
+            .filter(|tc| is_subagent_tool(&tc.name) && !resolved.contains(tc.id.as_str()))
+            .collect()
     }
     /// Color of the last generated thing, for the tab bar.
     fn state_color(&self) -> Color {
@@ -275,6 +309,8 @@ struct App {
     status: String,
     auto_clean: AutoClean,
     rename: Option<String>,
+    /// First-turn id of the chat marked as a manual group parent.
+    group_mark: Option<String>,
 }
 
 impl App {
@@ -287,6 +323,7 @@ impl App {
             status: "waiting for traffic".into(),
             auto_clean: AutoClean::Never,
             rename: None,
+            group_mark: None,
         }
     }
     fn packet(&mut self, packet: Packet) {
@@ -400,9 +437,11 @@ impl App {
         // A router can expose the same stream on several ports. Keep a single
         // chat per response id and let the first observed flow own it. Chunks
         // mirrored on another router leg must not create a second tab or append
-        // every streamed token a second time.
+        // every streamed token a second time. They can still contribute the
+        // client-side request metadata the owning (backend) leg lacks.
         let index = if let Some(index) = self.chats.iter().position(|c| c.has_id(id)) {
             if self.chats[index].flow != flow_key {
+                self.adopt_mirrored(index, flow_key);
                 return;
             }
             index
@@ -414,12 +453,21 @@ impl App {
                 .cloned();
             let request = captured.as_ref().map(|c| c.body.clone());
             let thread = captured.and_then(|c| c.thread);
+            // A subagent generation is a separate pi process with its own
+            // session; never fold it into the parent's message history.
+            let subagent = request.as_ref().is_some_and(looks_like_subagent_request);
             // A new response id that continues a previous session after a tool
             // call is another turn of the same conversation: append it instead
             // of opening a new tab.
-            if let Some(index) = self.continuation(flow_key, request.as_ref(), thread.as_deref()) {
+            let continued = if subagent {
+                None
+            } else {
+                self.continuation(flow_key, request.as_ref(), thread.as_deref())
+            };
+            if let Some(index) = continued {
                 let chat = &mut self.chats[index];
                 chat.flow = flow_key.into();
+                chat.last_activity = Instant::now();
                 chat.turns.push(Turn::new(id.into(), request));
                 self.status = format!("continued {} → {id}", chat.id());
                 index
@@ -430,18 +478,33 @@ impl App {
                     .or_else(|| request.as_ref()?.get("model")?.as_str())
                     .unwrap_or("unknown")
                     .into();
-                self.chats.push(Chat::new(
-                    id.into(),
-                    request,
-                    model,
-                    flow_key.into(),
-                    thread,
-                ));
-                self.status = format!("captured {id}");
-                self.chats.len() - 1
+                let mut chat =
+                    Chat::new(id.into(), request.clone(), model, flow_key.into(), thread);
+                let parent = self.subagent_parent(request.as_ref());
+                let position = match parent {
+                    Some(parent_index) => {
+                        let parent_id = self.chats[parent_index].id().to_owned();
+                        chat.parent = Some(parent_id.clone());
+                        self.status = format!("grouped {id} under {parent_id}");
+                        self.group_end(&parent_id)
+                    }
+                    None => {
+                        self.status = format!("captured {id}");
+                        self.chats.len()
+                    }
+                };
+                let had_chats = !self.chats.is_empty();
+                self.chats.insert(position, chat);
+                // Keep the selection on the same chat when another one is
+                // inserted before it. Appending never moves it.
+                if had_chats && position <= self.selected {
+                    self.selected += 1;
+                }
+                position
             }
         };
         let chat = &mut self.chats[index];
+        chat.last_activity = Instant::now();
         if let Some(model) = value.get("model").and_then(Value::as_str) {
             chat.model = model.into();
         }
@@ -550,14 +613,6 @@ impl App {
         request: Option<&Value>,
         thread: Option<&str>,
     ) -> Option<usize> {
-        // An explicit thread identity is authoritative: merge with the chat
-        // that declared it, and never merge across two different declarations.
-        if let Some(thread) = thread {
-            return self
-                .chats
-                .iter()
-                .position(|chat| chat.thread.as_deref() == Some(thread));
-        }
         let Some(request) = request else {
             // The request was not captured. If this response arrives on the
             // very connection whose last response ended with tool calls, it is
@@ -576,9 +631,26 @@ impl App {
             .flatten()
             .filter_map(|call| call.get("id").and_then(Value::as_str))
             .collect();
+        // A declared id narrows the candidates but does not have to identify a
+        // single chat: a parent and its grouped subagent can share the root
+        // session id sent by the harness. Content still decides between them.
+        let candidates: Vec<usize> = match thread {
+            Some(thread) => self
+                .chats
+                .iter()
+                .enumerate()
+                .filter(|(_, chat)| chat.thread.as_deref() == Some(thread))
+                .map(|(index, _)| index)
+                .collect(),
+            None => (0..self.chats.len()).collect(),
+        };
+        if thread.is_some() && candidates.is_empty() {
+            // A brand-new conversation declaring its own id.
+            return None;
+        }
         let mut best: Option<((usize, usize), usize)> = None;
-        for (index, chat) in self.chats.iter().enumerate() {
-            let turn = chat.last();
+        for index in candidates.iter().copied() {
+            let turn = self.chats[index].last();
             let tool_ids: HashSet<&str> = turn
                 .tool_calls
                 .iter()
@@ -618,7 +690,159 @@ impl App {
                 best = Some((score, index));
             }
         }
+        if let Some((_, index)) = best {
+            return Some(index);
+        }
+        // The id alone is enough when no history was captured: pick the chat
+        // that was active most recently among those sharing it.
+        thread.and_then(|_| {
+            candidates
+                .into_iter()
+                .max_by_key(|&index| self.chats[index].last_activity)
+        })
+    }
+    /// The client leg of a mirrored stream can carry request metadata the
+    /// owning (router backend) leg lacks. Adopt what the chat is missing.
+    fn adopt_mirrored(&mut self, index: usize, flow_key: &str) {
+        let Some(captured) = self
+            .flows
+            .get(flow_key)
+            .and_then(|f| f.requests.last())
+            .cloned()
+        else {
+            return;
+        };
+        let chat = &mut self.chats[index];
+        if chat.thread.is_none() {
+            chat.thread = captured.thread;
+        }
+        let turn = chat.turns.last_mut().expect("chat has a turn");
+        if turn.request.is_none() {
+            turn.request = Some(captured.body);
+        }
+    }
+    /// Find the chat that most likely spawned this generation as a subagent.
+    /// A parent qualifies while it waits on an unresolved subagent tool call.
+    /// The brief it passed is matched against the child request when captured;
+    /// otherwise the most recently active parent wins.
+    fn subagent_parent(&self, request: Option<&Value>) -> Option<usize> {
+        // A normal conversation must never be grouped just because some other
+        // chat is waiting on a tool. A captured request qualifies only when it
+        // carries a subagent profile prompt or echoes the brief the parent
+        // passed to the tool. When the request was missed, the timing and open
+        // tool-call window is all that remains.
+        let plain = request.map(request_plain_text).unwrap_or_default();
+        let profile = request.is_some_and(looks_like_subagent_request);
+        let mut best: Option<(usize, usize)> = None;
+        for (index, chat) in self.chats.iter().enumerate() {
+            let calls = chat.open_subagent_calls();
+            if calls.is_empty() {
+                continue;
+            }
+            if chat.last_activity.elapsed() > Duration::from_secs(300) {
+                continue;
+            }
+            let brief_match = calls.iter().any(|call| {
+                briefs(&call.arguments).iter().any(|brief| {
+                    let needle = first_chars(brief, 80);
+                    needle.chars().count() >= 40 && plain.contains(&needle)
+                })
+            });
+            if request.is_some() && !profile && !brief_match {
+                continue;
+            }
+            let score = usize::from(brief_match) * 10
+                + usize::from(profile)
+                + usize::from(request.is_none());
+            if best.is_none_or(|(best_score, _)| score >= best_score) {
+                best = Some((score, index));
+            }
+        }
         best.map(|(_, index)| index)
+    }
+    /// Insertion point just after a chat and its already grouped descendants.
+    fn group_end(&self, parent_id: &str) -> usize {
+        let Some(parent) = self.chats.iter().position(|c| c.id() == parent_id) else {
+            return self.chats.len();
+        };
+        let mut end = parent + 1;
+        while end < self.chats.len() && self.in_subtree(end, parent_id) {
+            end += 1;
+        }
+        end
+    }
+    fn in_subtree(&self, mut index: usize, root_id: &str) -> bool {
+        for _ in 0..self.chats.len() {
+            let Some(parent) = self.chats[index].parent.as_deref() else {
+                return false;
+            };
+            if parent == root_id {
+                return true;
+            }
+            let Some(next) = self.chats.iter().position(|c| c.id() == parent) else {
+                return false;
+            };
+            index = next;
+        }
+        false
+    }
+    /// Manually group the selected tab under the one on its left. Useful for
+    /// conversations that were already split before grouping heuristics could
+    /// see them.
+    /// Manual grouping is a two-step mark: press `g` on the parent, select the
+    /// child, press `g` again. The child's subtree moves right after the
+    /// parent's group.
+    fn group(&mut self) {
+        let Some(chat) = self.chats.get(self.selected) else {
+            self.status = "no chat to group".into();
+            return;
+        };
+        let chat_id = chat.id().to_owned();
+        let Some(parent_id) = self.group_mark.take() else {
+            self.status = format!("group parent {chat_id}: select a child and press g");
+            self.group_mark = Some(chat_id);
+            return;
+        };
+        if parent_id == chat_id {
+            self.status = "group mark cleared".into();
+            return;
+        }
+        let Some(parent_index) = self.chats.iter().position(|c| c.id() == parent_id) else {
+            self.status = "group parent tab was closed".into();
+            return;
+        };
+        if self.in_subtree(parent_index, &chat_id) {
+            self.status = "cannot group a chat under its own child".into();
+            return;
+        }
+        let start = self.selected;
+        let end = self.subtree_end(start);
+        let mut block: Vec<Chat> = self.chats.drain(start..end).collect();
+        if let Some(first) = block.first_mut() {
+            first.parent = Some(parent_id.clone());
+        }
+        let position = self.group_end(&parent_id).min(self.chats.len());
+        self.chats.splice(position..position, block);
+        self.selected = position;
+        self.status = format!("grouped under {parent_id}");
+    }
+    fn subtree_end(&self, index: usize) -> usize {
+        let root = self.chats[index].id().to_owned();
+        let mut end = index + 1;
+        while end < self.chats.len() && self.in_subtree(end, &root) {
+            end += 1;
+        }
+        end
+    }
+    fn ungroup(&mut self) {
+        let Some(chat) = self.chats.get_mut(self.selected) else {
+            self.status = "no chat to ungroup".into();
+            return;
+        };
+        self.status = match chat.parent.take() {
+            Some(parent) => format!("ungrouped from {parent}"),
+            None => "chat is not grouped".into(),
+        };
     }
     /// Manually regroup: append the selected chat to the one on its left as a
     /// continuation. A safety net for conversations whose requests and
@@ -632,11 +856,21 @@ impl App {
         let index = self.selected - 1;
         self.selected = index;
         let turns = chat.turns.len();
+        let merged_id = chat.id().to_owned();
+        if self.group_mark.as_deref() == Some(merged_id.as_str()) {
+            self.group_mark = Some(self.chats[index].id().to_owned());
+        }
+        let target_id = self.chats[index].id().to_owned();
         let target = &mut self.chats[index];
         target.thread = target.thread.take().or(chat.thread);
         target.turns.extend(chat.turns);
         target.flow = chat.flow;
-        self.status = format!("merged {turns} turns into {}", target.id());
+        for other in self.chats.iter_mut() {
+            if other.parent.as_deref() == Some(merged_id.as_str()) {
+                other.parent = Some(target_id.clone());
+            }
+        }
+        self.status = format!("merged {turns} turns into {target_id}");
     }
     fn close(&mut self) {
         self.close_at(self.selected)
@@ -646,6 +880,11 @@ impl App {
             return;
         }
         let chat = self.chats.remove(index);
+        let closed_id = chat.id().to_owned();
+        if self.group_mark.as_deref() == Some(closed_id.as_str()) {
+            self.group_mark = None;
+        }
+        let grandparent = chat.parent.clone();
         for turn in &chat.turns {
             self.ignored.insert(turn.id.clone());
         }
@@ -653,6 +892,12 @@ impl App {
             flow.requests.clear();
             flow.request_buf.clear();
             flow.response_buf.clear();
+        }
+        // Do not silently drop subagent tabs when their parent goes away.
+        for other in self.chats.iter_mut() {
+            if other.parent.as_deref() == Some(closed_id.as_str()) {
+                other.parent = grandparent.clone();
+            }
         }
         if self.chats.is_empty() {
             self.selected = 0;
@@ -662,7 +907,7 @@ impl App {
             }
             self.selected = self.selected.min(self.chats.len() - 1);
         }
-        self.status = format!("closed and forgot {}", chat.id());
+        self.status = format!("closed and forgot {closed_id}");
     }
     fn dump(&mut self) {
         let Some(chat) = self.chats.get(self.selected) else {
@@ -816,6 +1061,76 @@ fn thread_key_from_body(body: &Value) -> Option<String> {
         .iter()
         .find_map(|field| metadata.get(*field).and_then(usable))
 }
+
+/// Tool names a harness uses to spawn a child generation. Cindy/pi's subagent
+/// extension uses `subagent`; the others cover common conventions.
+fn is_subagent_tool(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "subagent" | "spawn_agent" | "task" | "delegate"
+    )
+}
+
+/// A child generation carries one of the subagent profile prompts that the
+/// spawning extension appends. Normal conversations must not be grouped just
+/// because some parent is waiting on a tool.
+fn looks_like_subagent_request(request: &Value) -> bool {
+    let text = request_plain_text(request).to_ascii_lowercase();
+    [
+        "you are a scout subagent",
+        "you are a code review subagent",
+        "you are a planning subagent",
+        "you are a worker subagent",
+        "do not expand scope or spawn another subagent",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+/// Unescaped text of a request's messages, for substring matching against the
+/// brief a parent passed to its subagent tool.
+fn request_plain_text(request: &Value) -> String {
+    let Some(messages) = request.get("messages").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for message in messages {
+        match message.get("content") {
+            Some(Value::String(s)) => out.push_str(s),
+            Some(other) => {
+                if let Ok(s) = serde_json::to_string(other) {
+                    out.push_str(&s);
+                }
+            }
+            None => {}
+        }
+        out.push('\n');
+        if out.len() > 256 * 1024 {
+            break;
+        }
+    }
+    out
+}
+
+/// Long string values embedded in a tool call's JSON arguments: task briefs,
+/// prompts and instructions. These are the phrases a child generation echoes
+/// back in its own request.
+fn briefs(arguments: &str) -> Vec<String> {
+    fn walk(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(s) if s.chars().count() >= 40 => out.push(s.clone()),
+            Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
+            Value::Object(map) => map.values().for_each(|item| walk(item, out)),
+            _ => {}
+        }
+    }
+    let Ok(parsed) = serde_json::from_str::<Value>(arguments) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    walk(&parsed, &mut out);
+    out
+}
 /// First balanced JSON object in `s`, scanning past SSE `data:` prefixes.
 fn first_json(s: &str) -> Option<Value> {
     let start = s.find('{')?;
@@ -943,6 +1258,9 @@ fn stats_text(c: &Chat) -> String {
     ]);
     if let Some(thread) = c.thread.as_deref() {
         stats.push(format!("Thread: {thread}"));
+    }
+    if let Some(parent) = c.parent.as_deref() {
+        stats.push(format!("Parent: {}", middle_elide(parent, 32)));
     }
     if c.turns.len() > 1 {
         stats.push(format!("Turns: {}", c.turns.len()));
@@ -1420,8 +1738,9 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 // call, gray for thinking, white for an answer.
                 let marker = if c.finish().is_none() { "●" } else { "✓" };
                 let label = c.name.clone().unwrap_or_else(|| c.id().to_owned());
+                let prefix = if c.parent.is_some() { "↳ " } else { "" };
                 (
-                    format!(" {} {} ", middle_elide(&label, 24), marker),
+                    format!(" {prefix}{} {} ", middle_elide(&label, 22), marker),
                     Style::default().fg(c.state_color()),
                 )
             })
@@ -1521,6 +1840,10 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 Span::raw(" close "),
                 key("m"),
                 Span::raw(" merge "),
+                key("g"),
+                Span::raw(" group "),
+                key("u"),
+                Span::raw(" ungroup "),
                 key("d"),
                 Span::raw(" dump "),
                 key("a"),
@@ -1637,6 +1960,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 KeyCode::Char('x') => app.close(),
                 KeyCode::Char('m') => app.merge_prev(),
+                KeyCode::Char('g') => app.group(),
+                KeyCode::Char('u') => app.ungroup(),
                 KeyCode::Char('d') => app.dump(),
                 KeyCode::Char('a') => {
                     app.auto_clean = app.auto_clean.next();
@@ -2126,6 +2451,204 @@ mod tests {
         }
     }
 
+    fn subagent_parent_response(id: &str, brief: &str) -> Value {
+        json!({
+            "id": id,
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0, "id": format!("call_{id}"),
+                "function": {"name": "subagent", "arguments": json!({
+                    "agent": "reviewer", "task": brief
+                }).to_string()}
+            }]}, "finish_reason": "tool_calls"}]
+        })
+    }
+
+    #[test]
+    fn subagent_generation_is_grouped_under_its_parent() {
+        let mut app = App::new();
+        app.response(
+            "f",
+            subagent_parent_response("p1", "review the Caverace constructor wiring"),
+        );
+        // The child request was not captured; grouping falls back to the open
+        // subagent tool call on the recent parent.
+        app.response(
+            "g",
+            json!({"id": "s1", "choices": [{"delta": {"content": "reviewing"}}]}),
+        );
+
+        assert_eq!(app.chats.len(), 2);
+        assert_eq!(app.chats[0].id(), "p1");
+        assert_eq!(app.chats[1].id(), "s1");
+        assert_eq!(app.chats[1].parent.as_deref(), Some("p1"));
+        assert_eq!(app.selected, 0, "grouping must not steal the selection");
+    }
+
+    #[test]
+    fn subagent_request_groups_to_the_parent_with_matching_brief() {
+        let mut app = App::new();
+        let brief_a = "review the login handler and report the token refresh bug";
+        let brief_b = "review the Caverace constructor and report the missing callbacks";
+        app.response("a", subagent_parent_response("p1", brief_a));
+        app.response("b", subagent_parent_response("p2", brief_b));
+
+        app.packet(request_start(5000, &[]));
+        app.packet(request_body(
+            5000,
+            json!({
+                "model": "qwen",
+                "messages": [
+                    {"role": "system", "content": "You are a code review subagent. Review what you were asked to review."},
+                    {"role": "user", "content": brief_b}
+                ]
+            }),
+        ));
+        app.response(
+            "127.0.0.1:5000 <-> 127.0.0.1:8080",
+            json!({"id": "s1", "choices": [{"delta": {"content": "reviewing"}}]}),
+        );
+
+        let child = app
+            .chats
+            .iter()
+            .find(|c| c.id() == "s1")
+            .expect("child chat");
+        assert_eq!(
+            child.parent.as_deref(),
+            Some("p2"),
+            "brief must pick the right parent"
+        );
+    }
+
+    #[test]
+    fn shared_thread_id_is_disambiguated_by_tool_call_id() {
+        let mut app = App::new();
+        app.response(
+            "f",
+            json!({"id": "p1", "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_p", "function": {"name": "search", "arguments": "{}"}}
+            ]}, "finish_reason": "tool_calls"}]}),
+        );
+        app.response(
+            "g",
+            json!({"id": "s1", "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_s", "function": {"name": "search", "arguments": "{}"}}
+            ]}, "finish_reason": "tool_calls"}]}),
+        );
+        // A harness may send the same root session id for a parent and its
+        // subagent. Content must still route each follow-up to its own chat.
+        for chat in &mut app.chats {
+            chat.thread = Some("thread:root-abcdefgh".into());
+        }
+        let next_request = |tool_id: &str| {
+            json!({
+                "model": "qwen",
+                "prompt_cache_key": "root-abcdefgh",
+                "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [{
+                        "id": tool_id, "type": "function",
+                        "function": {"name": "search", "arguments": "{}"}
+                    }]},
+                    {"role": "tool", "tool_call_id": tool_id, "content": "ok"}
+                ]
+            })
+        };
+        app.packet(request_start(5000, &[]));
+        app.packet(request_body(5000, next_request("call_s")));
+        app.response(
+            "127.0.0.1:5000 <-> 127.0.0.1:8080",
+            json!({"id": "c3", "choices": [{"delta": {"content": "child continued"}}]}),
+        );
+        app.packet(request_start(5001, &[]));
+        app.packet(request_body(5001, next_request("call_p")));
+        app.response(
+            "127.0.0.1:5001 <-> 127.0.0.1:8080",
+            json!({"id": "c4", "choices": [{"delta": {"content": "parent continued"}}]}),
+        );
+
+        assert_eq!(app.chats.len(), 2);
+        assert_eq!(app.chats[0].turns.len(), 2);
+        assert_eq!(app.chats[0].last().answer, "parent continued");
+        assert_eq!(app.chats[1].turns.len(), 2);
+        assert_eq!(app.chats[1].last().answer, "child continued");
+    }
+
+    #[test]
+    fn normal_conversation_is_not_grouped_under_a_waiting_parent() {
+        let mut app = App::new();
+        app.response(
+            "f",
+            subagent_parent_response("p1", "review the Caverace constructor wiring"),
+        );
+        app.packet(request_start(5000, &[]));
+        app.packet(request_body(
+            5000,
+            json!({"model": "qwen", "messages": [{"role": "user", "content": "unrelated question"}]}),
+        ));
+        app.response(
+            "127.0.0.1:5000 <-> 127.0.0.1:8080",
+            json!({"id": "c2", "choices": [{"delta": {"content": "answer"}}]}),
+        );
+
+        assert_eq!(app.chats.len(), 2);
+        assert!(
+            app.chats.iter().all(|c| c.parent.is_none()),
+            "only subagent-shaped requests may be grouped"
+        );
+    }
+
+    #[test]
+    fn closed_parent_reparents_its_children() {
+        let mut app = App::new();
+        app.response(
+            "f",
+            subagent_parent_response("p1", "review the Caverace constructor wiring"),
+        );
+        app.response(
+            "g",
+            json!({"id": "s1", "choices": [{"delta": {"content": "reviewing"}}]}),
+        );
+        app.selected = 0;
+        app.close();
+
+        assert_eq!(app.chats.len(), 1);
+        assert_eq!(app.chats[0].id(), "s1");
+        assert!(app.chats[0].parent.is_none(), "orphans become roots");
+    }
+
+    #[test]
+    fn mirrored_leg_contributes_thread_id_and_request() {
+        let mut app = App::new();
+        // Router backend leg wins the response id first, with no request.
+        app.response(
+            "backend <-> upstream",
+            json!({"id": "c1", "choices": [{"delta": {"content": "hello"}}]}),
+        );
+        assert!(app.chats[0].thread.is_none());
+        // Client leg carries the declared session and the request body.
+        app.packet(request_start(5000, &[("x-session-id", "thread-abcdefgh")]));
+        app.packet(request_body(
+            5000,
+            json!({"model": "qwen", "messages": [{"role": "user", "content": "hi"}]}),
+        ));
+        app.response(
+            "127.0.0.1:5000 <-> 127.0.0.1:8080",
+            json!({"id": "c1", "choices": [{"delta": {"content": "hello"}}]}),
+        );
+
+        assert_eq!(app.chats.len(), 1);
+        assert_eq!(
+            app.chats[0].thread.as_deref(),
+            Some("thread:thread-abcdefgh")
+        );
+        assert!(app.chats[0].last().request.is_some(), "request adopted");
+        assert_eq!(
+            app.chats[0].last().answer,
+            "hello",
+            "mirror not appended twice"
+        );
+    }
+
     #[test]
     fn header_thread_id_groups_requests_across_connections() {
         let mut app = App::new();
@@ -2315,6 +2838,43 @@ mod tests {
             2,
             "a different tool id is a different session"
         );
+    }
+
+    #[test]
+    fn manual_grouping_marks_a_parent_then_moves_the_selected_subtree() {
+        let mut app = App::new();
+        for id in ["a", "b", "c"] {
+            app.response(
+                id,
+                json!({"id": id, "choices": [{"delta": {"content": id}}]}),
+            );
+        }
+        // Mark a as the group parent, then attach c to it.
+        app.selected = 0;
+        app.group();
+        assert_eq!(app.group_mark.as_deref(), Some("a"));
+        app.selected = 2;
+        app.group();
+        assert_eq!(app.chats[1].id(), "c");
+        assert_eq!(app.chats[1].parent.as_deref(), Some("a"));
+        assert_eq!(app.selected, 1);
+        assert!(app.group_mark.is_none());
+
+        // c is now a child of a; grouping a under c must be refused (cycle).
+        app.selected = 1;
+        app.group(); // mark c
+        app.selected = 0;
+        app.group(); // try to attach a under c
+        assert_eq!(app.chats[0].parent, None, "cycle must be rejected");
+
+        // Marking b then attaching c moves c's subtree under b.
+        app.selected = 2; // b
+        app.group();
+        app.selected = 1; // c
+        app.group();
+        assert_eq!(app.chats[1].id(), "b");
+        assert_eq!(app.chats[2].id(), "c");
+        assert_eq!(app.chats[2].parent.as_deref(), Some("b"));
     }
 
     #[test]

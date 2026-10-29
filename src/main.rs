@@ -264,12 +264,11 @@ impl Chat {
             .last()
             .request
             .as_ref()
-            .and_then(|r| r.get("messages"))
-            .and_then(Value::as_array)
+            .and_then(request_messages)
             .into_iter()
             .flatten()
-            .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
-            .filter_map(|m| m.get("tool_call_id").and_then(Value::as_str))
+            .filter(|m| str_field(m, "role") == Some("tool"))
+            .filter_map(|m| str_field(m, "tool_call_id"))
             .collect();
         self.last()
             .tool_calls
@@ -468,7 +467,7 @@ impl App {
         if !is_llm_response(&value) {
             return;
         }
-        let Some(id) = value.get("id").and_then(Value::as_str) else {
+        let Some(id) = str_field(&value, "id") else {
             return;
         };
         if self.ignored.contains(id) {
@@ -512,10 +511,8 @@ impl App {
                 self.status = format!("continued {} → {id}", chat.id());
                 index
             } else {
-                let model = value
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .or_else(|| request.as_ref()?.get("model")?.as_str())
+                let model = str_field(&value, "model")
+                    .or_else(|| request.as_ref().and_then(|r| str_field(r, "model")))
                     .unwrap_or("unknown")
                     .into();
                 let mut chat =
@@ -545,7 +542,7 @@ impl App {
         };
         let chat = &mut self.chats[index];
         chat.last_activity = Instant::now();
-        if let Some(model) = value.get("model").and_then(Value::as_str) {
+        if let Some(model) = str_field(&value, "model") {
             chat.model = model.into();
         }
         if let Some(backend) = detect_backend(&value) {
@@ -564,14 +561,11 @@ impl App {
                 return;
             };
             let delta = choice.get("delta").or_else(|| choice.get("message"));
-            if let Some(s) = delta
-                .and_then(|v| v.get("reasoning_content"))
-                .and_then(Value::as_str)
-            {
+            if let Some(s) = delta.and_then(|v| str_field(v, "reasoning_content")) {
                 turn.reasoning.push_str(s);
                 turn.push(SegKind::Thinking, s);
             }
-            if let Some(s) = delta.and_then(|v| v.get("content")).and_then(Value::as_str) {
+            if let Some(s) = delta.and_then(|v| str_field(v, "content")) {
                 turn.answer.push_str(s);
                 turn.push(SegKind::Answer, s);
             }
@@ -594,9 +588,7 @@ impl App {
                     {
                         let tc = &mut turn.tool_calls[idx];
                         if tc.id.is_empty() {
-                            tc.id = call
-                                .get("id")
-                                .and_then(Value::as_str)
+                            tc.id = str_field(call, "id")
                                 .map(str::to_owned)
                                 .unwrap_or_default();
                         }
@@ -610,10 +602,7 @@ impl App {
                         }
                     }
                     if let Some(args) = call.pointer("/function/arguments") {
-                        let frag = match args {
-                            Value::String(s) => s.clone(),
-                            other => serde_json::to_string(other).unwrap_or_default(),
-                        };
+                        let frag = text_of(args, false);
                         if !frag.is_empty() && !label.is_empty() {
                             label.push(' ');
                         }
@@ -625,7 +614,7 @@ impl App {
                     turn.push_tool(idx, &label);
                 }
             }
-            if let Some(s) = choice.get("finish_reason").and_then(Value::as_str) {
+            if let Some(s) = str_field(choice, "finish_reason") {
                 turn.finish = Some(s.into());
                 turn.close_active();
             }
@@ -664,12 +653,12 @@ impl App {
                         || !chat.last().tool_calls.is_empty())
             });
         };
-        let new_msgs = request.get("messages")?.as_array()?;
+        let new_msgs = request_messages(request)?;
         let request_ids: HashSet<&str> = new_msgs
             .iter()
             .filter_map(|m| m.get("tool_calls").and_then(Value::as_array))
             .flatten()
-            .filter_map(|call| call.get("id").and_then(Value::as_str))
+            .filter_map(|call| str_field(call, "id"))
             .collect();
         // A declared id narrows the candidates but does not have to identify a
         // single chat: a parent and its grouped subagent can share the root
@@ -701,8 +690,7 @@ impl App {
             let prefix_len = turn
                 .request
                 .as_ref()
-                .and_then(|r| r.get("messages"))
-                .and_then(Value::as_array)
+                .and_then(request_messages)
                 .filter(|prev| {
                     !prev.is_empty()
                         && new_msgs.len() > prev.len()
@@ -718,10 +706,9 @@ impl App {
             // A prefix-only match could be a different conversation that shares
             // a common opening: require tool output right after the prefix.
             if id_matches == 0
-                && !new_msgs[prefix_len..].iter().any(|m| {
-                    m.get("role").and_then(Value::as_str) == Some("tool")
-                        || m.get("tool_calls").is_some()
-                })
+                && !new_msgs[prefix_len..]
+                    .iter()
+                    .any(|m| str_field(m, "role") == Some("tool") || m.get("tool_calls").is_some())
             {
                 continue;
             }

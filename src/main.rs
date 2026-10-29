@@ -1,12 +1,15 @@
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+        MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
@@ -87,6 +90,10 @@ struct Segment {
     chars: usize,
     started: Instant,
     ended: Option<Instant>,
+    /// For tool segments: index into `Turn::tool_calls` of the call that
+    /// generated the segment, so the timeline can anchor to the call's line
+    /// in the body panel.
+    tool_call: Option<usize>,
 }
 impl Segment {
     fn tokens(&self) -> usize {
@@ -150,7 +157,21 @@ impl Turn {
             chars,
             started: Instant::now(),
             ended: None,
+            tool_call: None,
         });
+    }
+    /// Like `push`, but records which tool call generated the text. Consecutive
+    /// deltas of one call (or several calls in one delta) merge into a single
+    /// segment that keeps the index of the first call.
+    fn push_tool(&mut self, call: usize, text: &str) {
+        let fresh = self
+            .segments
+            .last()
+            .is_none_or(|s| s.kind != SegKind::Tool || s.ended.is_some());
+        self.push(SegKind::Tool, text);
+        if fresh && let Some(last) = self.segments.last_mut() {
+            last.tool_call = Some(call);
+        }
     }
     fn close_active(&mut self) {
         if let Some(last) = self.segments.last_mut() {
@@ -311,6 +332,15 @@ struct App {
     rename: Option<String>,
     /// First-turn id of the chat marked as a manual group parent.
     group_mark: Option<String>,
+    /// Last frame's panel geometry and the timeline/body anchors of the
+    /// selected chat, so mouse events can map to a timeline row or a body row.
+    timeline_area: Rect,
+    body_area: Rect,
+    /// Timeline content row → flat segment index (None on turn separators).
+    timeline_segments: Vec<Option<usize>>,
+    /// Flat segment index → display row at which the segment's text starts in
+    /// the body panel (after wrapping).
+    body_anchors: Vec<usize>,
 }
 
 impl App {
@@ -324,6 +354,10 @@ impl App {
             auto_clean: AutoClean::Never,
             rename: None,
             group_mark: None,
+            timeline_area: Rect::default(),
+            body_area: Rect::default(),
+            timeline_segments: Vec::new(),
+            body_anchors: Vec::new(),
         }
     }
     fn packet(&mut self, packet: Packet) {
@@ -582,7 +616,7 @@ impl App {
                     }
                     // Count the tool name too, so a call with empty arguments
                     // still produces a tool segment (and turns the tab orange).
-                    turn.push(SegKind::Tool, &label);
+                    turn.push_tool(idx, &label);
                 }
             }
             if let Some(s) = choice.get("finish_reason").and_then(Value::as_str) {
@@ -1531,20 +1565,33 @@ fn format_duration(d: Duration) -> String {
 
 /// The left-hand column: one entry per generated run of thinking, answer or
 /// tool call, in generation order, with its estimated token count and actual
-/// wall-clock duration.
-fn timeline_body(c: &Chat) -> Text<'static> {
-    let mut out: Vec<Line<'static>> = Vec::new();
+/// wall-clock duration. `segments` maps each content row to the flat index of
+/// its segment (turn order, then segment order) or to None on turn separators,
+/// so a mouse click on a row can jump the body panel to that segment.
+struct Timeline {
+    text: Text<'static>,
+    segments: Vec<Option<usize>>,
+}
+fn timeline_body(c: &Chat, active: Option<usize>) -> Timeline {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut segments: Vec<Option<usize>> = Vec::new();
     let dim = Style::default().fg(Color::DarkGray);
     let turns = c.turns.len();
+    let mut flat = 0usize;
     for (index, turn) in c.turns.iter().enumerate() {
         for segment in &turn.segments {
-            let active = segment.ended.is_none();
-            let marker = if active { "▶" } else { "•" };
+            let streaming = segment.ended.is_none();
+            let marker = if streaming { "▶" } else { "•" };
             let mut style = Style::default().fg(segment.kind.color());
-            if active {
+            if streaming {
                 style = style.add_modifier(Modifier::BOLD);
             }
-            out.push(Line::from(Span::styled(
+            // Underline the entry whose text currently starts the visible body
+            // area, so the timeline doubles as a scroll progress indicator.
+            if Some(flat) == active {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+            lines.push(Line::from(Span::styled(
                 format!(
                     "{marker} {:<8} {:>4}tok {}",
                     segment.kind.label(),
@@ -1553,18 +1600,114 @@ fn timeline_body(c: &Chat) -> Text<'static> {
                 ),
                 style,
             )));
+            segments.push(Some(flat));
+            flat += 1;
         }
         if turns > 1 && index + 1 < turns {
-            out.push(Line::from(Span::styled(
+            lines.push(Line::from(Span::styled(
                 format!("  ── turn {} ──", index + 2),
                 dim,
             )));
+            segments.push(None);
         }
     }
-    if out.is_empty() {
-        out.push(Line::from(Span::styled("  (no output yet)", dim)));
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled("  (no output yet)", dim)));
+        segments.push(None);
     }
-    Text::from(out)
+    Timeline {
+        text: Text::from(lines),
+        segments,
+    }
+}
+
+/// Number of newlines in the first `chars` characters of `text`.
+fn newlines_before(text: &str, chars: usize) -> usize {
+    text.chars().take(chars).filter(|&c| c == '\n').count()
+}
+
+/// Line offset, within the TOOL CALLS section text, at which each call's
+/// `[id] name` line starts, mirroring the skip order of `tool_calls_text`.
+fn tool_call_line_starts(turn: &Turn) -> Vec<usize> {
+    let mut starts = vec![usize::MAX; turn.tool_calls.len()];
+    let mut at = 0usize;
+    for (i, tc) in turn.tool_calls.iter().enumerate() {
+        if tc.id.is_empty() && tc.name.is_empty() && tc.arguments.is_empty() {
+            continue;
+        }
+        starts[i] = at;
+        at += 1;
+        if !compact_arguments(&tc.arguments).is_empty() {
+            at += 1;
+        }
+    }
+    starts
+}
+
+/// For every generated segment (turn order, then segment order), the display
+/// row — after wrapping at `width` — at which its text starts in the body
+/// built by `render_body`. Clicking a timeline row jumps the body scroll to
+/// that row; the row that starts the visible area underlines its entry.
+fn segment_anchor_rows(c: &Chat, body: &Text<'static>, width: u16) -> Vec<usize> {
+    let width = width.max(1) as usize;
+    // Display row at which each logical line of the body starts. A logical
+    // line wraps to ceil(its width / area width) display rows.
+    let mut line_rows: Vec<usize> = Vec::with_capacity(body.lines.len());
+    let mut row = 0usize;
+    for line in &body.lines {
+        line_rows.push(row);
+        row += line.width().div_ceil(width).max(1);
+    }
+    let mut out: Vec<usize> = Vec::new();
+    let mut line_idx = 0usize;
+    for (index, turn) in c.turns.iter().enumerate() {
+        if c.turns.len() > 1 {
+            line_idx += 2; // "=== TURN n ===" header line + blank line
+        }
+        let request = turn_request_text(&c.turns, index);
+        line_idx += 2 + request.lines().count(); // header + text + blank
+        let reasoning_start = line_idx + 1;
+        line_idx += 2 + turn.reasoning.lines().count();
+        let answer_start = line_idx + 1;
+        line_idx += 2 + turn.answer.lines().count();
+        let tool_start = if turn.tool_calls.is_empty() {
+            None
+        } else {
+            let start = line_idx + 1;
+            line_idx += 2 + tool_calls_text(turn).lines().count();
+            Some(start)
+        };
+        // Each kind's accumulated text is the concatenation of that kind's
+        // segments in generation order, so a segment's first line sits
+        // `newlines_before` past its section's first text line.
+        let tool_starts = tool_start.is_some().then(|| tool_call_line_starts(turn));
+        let mut thinking_at = 0usize;
+        let mut answer_at = 0usize;
+        for segment in &turn.segments {
+            let line = match segment.kind {
+                SegKind::Thinking => {
+                    let line = reasoning_start + newlines_before(&turn.reasoning, thinking_at);
+                    thinking_at += segment.chars;
+                    line
+                }
+                SegKind::Answer => {
+                    let line = answer_start + newlines_before(&turn.answer, answer_at);
+                    answer_at += segment.chars;
+                    line
+                }
+                SegKind::Tool => {
+                    let call = segment.tool_call.unwrap_or(0);
+                    let at = tool_starts
+                        .as_ref()
+                        .and_then(|starts| starts.get(call).copied())
+                        .unwrap_or(0);
+                    tool_start.unwrap_or(0) + at
+                }
+            };
+            out.push(line_rows.get(line).copied().unwrap_or(row));
+        }
+    }
+    out
 }
 
 fn build_tab_line(items: &[(String, Style)], selected: usize, available: usize) -> Line<'static> {
@@ -1765,11 +1908,6 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         .constraints([Constraint::Length(timeline_width), Constraint::Min(1)])
         .split(areas[1]);
     if let Some(c) = app.chats.get_mut(app.selected) {
-        frame.render_widget(
-            Paragraph::new(timeline_body(c))
-                .block(Block::default().borders(Borders::ALL).title(" timeline ")),
-            content[0],
-        );
         let stats = stats_text(c);
         let stats_height = stats
             .lines()
@@ -1785,11 +1923,31 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             details[0],
         );
         let body = render_body(c);
+        let inner_width = details[1].width.saturating_sub(2) as usize;
         let visible = details[1].height.saturating_sub(2) as usize;
-        let max = body.height().saturating_sub(visible).min(u16::MAX as usize) as u16;
+        // The body wraps at its inner width, so the scroll range must be
+        // measured in wrapped display rows, not logical lines.
+        let body_rows = body
+            .lines
+            .iter()
+            .map(|line| line.width().div_ceil(inner_width.max(1)).max(1))
+            .sum::<usize>();
+        let max = body_rows.saturating_sub(visible).min(u16::MAX as usize) as u16;
         if c.follow {
             c.scroll = max
         }
+        // The entry whose anchor starts the visible area is the scroll
+        // position marker of the timeline.
+        let anchors = segment_anchor_rows(c, &body, inner_width as u16);
+        let top = c.scroll.min(max) as usize;
+        let active = anchors.iter().rposition(|&anchor| anchor <= top);
+        let timeline = timeline_body(c, active);
+        let segment_rows = timeline.segments;
+        frame.render_widget(
+            Paragraph::new(timeline.text)
+                .block(Block::default().borders(Borders::ALL).title(" timeline ")),
+            content[0],
+        );
         frame.render_widget(
             Paragraph::new(body)
                 .block(Block::default().borders(Borders::ALL).title(format!(
@@ -1802,7 +1960,17 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 .scroll((c.scroll, 0)),
             details[1],
         );
+        // Keep the geometry and anchors for mouse events; `c` is not used
+        // below, so the borrow of `app.chats` is over.
+        app.timeline_area = content[0];
+        app.body_area = details[1];
+        app.timeline_segments = segment_rows;
+        app.body_anchors = anchors;
     } else {
+        app.timeline_area = Rect::default();
+        app.body_area = Rect::default();
+        app.timeline_segments.clear();
+        app.body_anchors.clear();
         frame.render_widget(
             Paragraph::new("(no chat)")
                 .block(Block::default().borders(Borders::ALL).title(" timeline ")),
@@ -1862,7 +2030,11 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
 
 fn restore(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
     let _ = terminal.show_cursor();
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1882,7 +2054,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut capture, rx) = spawn_ngrep(&interface)?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let mut app = App::new();
     let (name_tx, name_rx) = mpsc::channel::<(String, Result<String, String>)>();
@@ -1907,91 +2079,140 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         terminal.draw(|f| draw(f, &mut app))?;
-        if event::poll(Duration::from_millis(33))?
-            && let Event::Key(k) = event::read()?
-        {
-            if k.kind != KeyEventKind::Press {
-                continue;
-            }
-            if app.rename.is_some() {
-                match k.code {
-                    KeyCode::Char(c) => {
-                        if let Some(buf) = app.rename.as_mut() {
-                            buf.push(c)
+        if !event::poll(Duration::from_millis(33))? {
+            continue;
+        }
+        match event::read()? {
+            Event::Mouse(mouse) => {
+                match mouse.kind {
+                    // A click on the timeline jumps the body to that segment.
+                    MouseEventKind::Down(MouseButton::Left)
+                        if app.timeline_area.contains(Position {
+                            x: mouse.column,
+                            y: mouse.row,
+                        }) =>
+                    {
+                        let row =
+                            (mouse.row as usize).saturating_sub(app.timeline_area.y as usize + 1);
+                        if let Some(&Some(flat)) = app.timeline_segments.get(row)
+                            && let Some(&anchor) = app.body_anchors.get(flat)
+                            && let Some(c) = app.chats.get_mut(app.selected)
+                        {
+                            c.follow = false;
+                            c.scroll = anchor.min(u16::MAX as usize) as u16;
                         }
                     }
-                    KeyCode::Backspace => {
-                        if let Some(buf) = app.rename.as_mut() {
-                            buf.pop();
+                    // The wheel over the body scrolls it (and stops following).
+                    MouseEventKind::ScrollUp
+                        if app.body_area.contains(Position {
+                            x: mouse.column,
+                            y: mouse.row,
+                        }) =>
+                    {
+                        if let Some(c) = app.chats.get_mut(app.selected) {
+                            c.follow = false;
+                            c.scroll = c.scroll.saturating_sub(3);
                         }
                     }
-                    KeyCode::Enter => app.rename_commit(),
-                    KeyCode::Esc => {
-                        app.rename = None;
-                        app.status = "rename cancelled".into();
+                    MouseEventKind::ScrollDown
+                        if app.body_area.contains(Position {
+                            x: mouse.column,
+                            y: mouse.row,
+                        }) =>
+                    {
+                        if let Some(c) = app.chats.get_mut(app.selected) {
+                            c.scroll = c.scroll.saturating_add(3);
+                        }
                     }
                     _ => {}
                 }
                 continue;
             }
-            match k.code {
-                KeyCode::Char('q') => break Ok(()),
-                KeyCode::Left if !app.chats.is_empty() => {
-                    app.selected = app.selected.checked_sub(1).unwrap_or(app.chats.len() - 1)
+            Event::Key(k) => {
+                if k.kind != KeyEventKind::Press {
+                    continue;
                 }
-                KeyCode::Right if !app.chats.is_empty() => {
-                    app.selected = (app.selected + 1) % app.chats.len()
-                }
-                KeyCode::Up => {
-                    if let Some(c) = app.chats.get_mut(app.selected) {
-                        c.follow = false;
-                        c.scroll = c.scroll.saturating_sub(1)
+                if app.rename.is_some() {
+                    match k.code {
+                        KeyCode::Char(c) => {
+                            if let Some(buf) = app.rename.as_mut() {
+                                buf.push(c)
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            if let Some(buf) = app.rename.as_mut() {
+                                buf.pop();
+                            }
+                        }
+                        KeyCode::Enter => app.rename_commit(),
+                        KeyCode::Esc => {
+                            app.rename = None;
+                            app.status = "rename cancelled".into();
+                        }
+                        _ => {}
                     }
+                    continue;
                 }
-                KeyCode::Down => {
-                    if let Some(c) = app.chats.get_mut(app.selected) {
-                        c.scroll = c.scroll.saturating_add(1)
+                match k.code {
+                    KeyCode::Char('q') => break Ok(()),
+                    KeyCode::Left if !app.chats.is_empty() => {
+                        app.selected = app.selected.checked_sub(1).unwrap_or(app.chats.len() - 1)
                     }
-                }
-                KeyCode::End => {
-                    if let Some(c) = app.chats.get_mut(app.selected) {
-                        c.follow = true
+                    KeyCode::Right if !app.chats.is_empty() => {
+                        app.selected = (app.selected + 1) % app.chats.len()
                     }
-                }
-                KeyCode::Char('x') => app.close(),
-                KeyCode::Char('m') => app.merge_prev(),
-                KeyCode::Char('g') => app.group(),
-                KeyCode::Char('u') => app.ungroup(),
-                KeyCode::Char('d') => app.dump(),
-                KeyCode::Char('a') => {
-                    app.auto_clean = app.auto_clean.next();
-                    app.status = format!("auto-clean: {}", app.auto_clean.label())
-                }
-                KeyCode::Char('r') => {
-                    if app.chats.is_empty() {
-                        app.status = "no chat to rename".into()
-                    } else {
-                        app.rename = Some(String::new());
-                        app.status = "rename".into()
+                    KeyCode::Up => {
+                        if let Some(c) = app.chats.get_mut(app.selected) {
+                            c.follow = false;
+                            c.scroll = c.scroll.saturating_sub(1)
+                        }
                     }
+                    KeyCode::Down => {
+                        if let Some(c) = app.chats.get_mut(app.selected) {
+                            c.scroll = c.scroll.saturating_add(1)
+                        }
+                    }
+                    KeyCode::End => {
+                        if let Some(c) = app.chats.get_mut(app.selected) {
+                            c.follow = true
+                        }
+                    }
+                    KeyCode::Char('x') => app.close(),
+                    KeyCode::Char('m') => app.merge_prev(),
+                    KeyCode::Char('g') => app.group(),
+                    KeyCode::Char('u') => app.ungroup(),
+                    KeyCode::Char('d') => app.dump(),
+                    KeyCode::Char('a') => {
+                        app.auto_clean = app.auto_clean.next();
+                        app.status = format!("auto-clean: {}", app.auto_clean.label())
+                    }
+                    KeyCode::Char('r') => {
+                        if app.chats.is_empty() {
+                            app.status = "no chat to rename".into()
+                        } else {
+                            app.rename = Some(String::new());
+                            app.status = "rename".into()
+                        }
+                    }
+                    KeyCode::Char('R') => {
+                        let Some(c) = app.chats.get(app.selected) else {
+                            app.status = "no chat to name".into();
+                            continue;
+                        };
+                        let prompt = name_prompt(c);
+                        let id = c.id().to_owned();
+                        let model = env::var("SNIFF_NAMER").unwrap_or_else(|_| "gemma4:e2b".into());
+                        let tx = name_tx.clone();
+                        app.status = format!("ai-naming with {model}…");
+                        thread::spawn(move || {
+                            let res = run_namer(&model, &prompt);
+                            let _ = tx.send((id, res));
+                        });
+                    }
+                    _ => {}
                 }
-                KeyCode::Char('R') => {
-                    let Some(c) = app.chats.get(app.selected) else {
-                        app.status = "no chat to name".into();
-                        continue;
-                    };
-                    let prompt = name_prompt(c);
-                    let id = c.id().to_owned();
-                    let model = env::var("SNIFF_NAMER").unwrap_or_else(|_| "gemma4:e2b".into());
-                    let tx = name_tx.clone();
-                    app.status = format!("ai-naming with {model}…");
-                    thread::spawn(move || {
-                        let res = run_namer(&model, &prompt);
-                        let _ = tx.send((id, res));
-                    });
-                }
-                _ => {}
             }
+            _ => continue,
         }
     };
     let _ = capture.kill();
@@ -3003,10 +3224,83 @@ mod tests {
             Color::Rgb(255, 165, 0),
             "last output was a tool call"
         );
-        let timeline = timeline_body(chat).to_string();
+        let timeline = timeline_body(chat, None).text.to_string();
         assert!(timeline.contains("thinking"), "{timeline}");
         assert!(timeline.contains("answer"), "{timeline}");
         assert!(timeline.contains("tool"), "{timeline}");
+    }
+
+    fn chat_with_three_segments() -> Chat {
+        let mut app = App::new();
+        app.response(
+            "f",
+            json!({"id": "c1", "choices": [{"delta": {"reasoning_content": "pondering"}}]}),
+        );
+        app.response(
+            "f",
+            json!({"id": "c1", "choices": [{"delta": {"content": "hello world"}}]}),
+        );
+        app.response(
+            "f",
+            json!({"id": "c1", "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{\"q\":\"x\"}"}}
+            ]}, "finish_reason": "tool_calls"}]}),
+        );
+        app.chats.remove(0)
+    }
+
+    #[test]
+    fn segment_anchors_point_at_the_start_of_each_segment_in_the_body() {
+        let chat = chat_with_three_segments();
+        let body = render_body(&chat);
+        // Wider than every line here, so a logical line index is its row.
+        let anchors = segment_anchor_rows(&chat, &body, 120);
+        assert_eq!(anchors.len(), 3);
+        let line_row = |needle: &str| -> usize {
+            body.lines
+                .iter()
+                .position(|l| l.spans.iter().any(|s| s.content.as_ref() == needle))
+                .unwrap_or_else(|| panic!("line {needle:?} not in body: {body:?}"))
+        };
+        assert_eq!(anchors[0], line_row("pondering"));
+        assert_eq!(anchors[1], line_row("hello world"));
+        assert_eq!(anchors[2], line_row("[call_1] search"));
+        assert!(anchors[0] < anchors[1] && anchors[1] < anchors[2]);
+    }
+
+    #[test]
+    fn segment_anchors_count_wrapped_rows() {
+        let mut app = App::new();
+        app.response(
+            "f",
+            json!({"id": "c1", "choices": [{"delta": {"reasoning_content": "aaaaaaaaaa bbbbbbbbbb cccccccccc"}}]}),
+        );
+        let chat = &app.chats[0];
+        let body = render_body(chat);
+        let anchors = segment_anchor_rows(chat, &body, 10);
+        // Body at width 10: REQUEST header (2 rows) + no-capture line (3) +
+        // blank (1) + REASONING header (2) = 8 rows before the thinking text.
+        assert_eq!(anchors[0], 8);
+    }
+
+    #[test]
+    fn timeline_underlines_the_active_entry_only() {
+        let chat = chat_with_three_segments();
+        let tl = timeline_body(&chat, Some(1));
+        assert_eq!(tl.segments, vec![Some(0), Some(1), Some(2)]);
+        let underlined =
+            |l: &Line<'static>| l.spans[0].style.add_modifier.contains(Modifier::UNDERLINED);
+        assert!(underlined(&tl.text.lines[1]));
+        assert!(
+            tl.text
+                .lines
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != 1)
+                .all(|(_, l)| !underlined(l))
+        );
+        let none = timeline_body(&chat, None);
+        assert!(none.text.lines.iter().all(|l| !underlined(l)));
     }
 
     #[test]

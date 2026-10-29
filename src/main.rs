@@ -83,7 +83,7 @@ impl SegKind {
         match self {
             SegKind::Thinking => Color::DarkGray,
             SegKind::Answer => Color::White,
-            SegKind::Tool => Color::Rgb(255, 165, 0),
+            SegKind::Tool => TOOL_ORANGE,
         }
     }
 }
@@ -327,6 +327,8 @@ enum Dir {
     Request,
     Response,
 }
+const DIM: Style = Style::new().fg(Color::DarkGray);
+const TOOL_ORANGE: Color = Color::Rgb(255, 165, 0);
 struct App {
     flows: HashMap<String, Flow>,
     chats: Vec<Chat>,
@@ -1522,7 +1524,7 @@ fn body_section(out: &mut Vec<Line<'static>>, header: &str, text: &str, style: S
 fn render_body(c: &Chat) -> Text<'static> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let default = Style::default();
-    let orange = Style::default().fg(Color::Rgb(255, 165, 0));
+    let orange = Style::default().fg(TOOL_ORANGE);
     for (index, turn) in c.turns.iter().enumerate() {
         if c.turns.len() > 1 {
             body_section(
@@ -1577,7 +1579,7 @@ struct Timeline {
 fn timeline_body(c: &Chat, active: Option<usize>) -> Timeline {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut segments: Vec<Option<usize>> = Vec::new();
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = DIM;
     let turns = c.turns.len();
     let mut flat = 0usize;
     for (index, turn) in c.turns.iter().enumerate() {
@@ -1743,7 +1745,7 @@ fn build_tab_line(items: &[(String, Style)], selected: usize, available: usize) 
     while a > 0 && fits(a - 1, b) {
         a -= 1;
     }
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = DIM;
     let mut spans: Vec<Span> = Vec::new();
     if a > 0 {
         spans.push(Span::styled(ind_text(a), dim));
@@ -1995,7 +1997,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             Span::raw(format!(" {buf} ")),
             Span::styled(
                 "│ Enter=save  Esc=cancel",
-                Style::default().fg(Color::DarkGray),
+                DIM,
             ),
         ]),
         None => {

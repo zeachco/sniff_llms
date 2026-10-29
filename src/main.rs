@@ -1917,6 +1917,13 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(timeline_width), Constraint::Min(1)])
         .split(areas[1]);
+    render_chat_panes(frame, app, &content);
+    frame.render_widget(Paragraph::new(status_bar(app)), areas[2]);
+}
+
+/// Render the timeline/stats/body panes for the selected chat, and record the
+/// pane geometry for mouse events.
+fn render_chat_panes(frame: &mut ratatui::Frame, app: &mut App, content: &[Rect]) {
     if let Some(c) = app.chats.get_mut(app.selected) {
         let stats = stats_text(c);
         let stats_height = stats
@@ -1992,7 +1999,11 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             content[1],
         );
     }
-    let bottom = match app.rename.as_ref() {
+}
+
+/// The bottom status line: rename editor when active, keymap otherwise.
+fn status_bar(app: &App) -> Line<'static> {
+    match app.rename.as_ref() {
         Some(buf) => Line::from(vec![
             Span::styled(
                 " rename ",
@@ -2034,8 +2045,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 Span::raw(" quit"),
             ])
         }
-    };
-    frame.render_widget(Paragraph::new(bottom), areas[2]);
+    }
 }
 
 fn restore(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {

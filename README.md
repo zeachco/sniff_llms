@@ -24,19 +24,29 @@ router mirrors the same response ID across multiple port pairs, the first
 observed flow owns one conversation tab and chunks from the other legs are
 ignored, preventing duplicated streamed output.
 
-A response that continues a previous one after a tool call is composed into
-the same tab instead of opening a new one. The primary signal is the tool-call
-id: the new request echoes the assistant `tool_calls` that the previous turn
-emitted, which works even when the previous request was never captured or the
-client rewrites its history between calls (dynamic system prompts). Ids are
-unique, so identical-looking parallel sessions stay apart. When no id was
-captured, the fallback is a message-for-message prefix match followed by tool
-output, then — when the request itself was missed — a response arriving on the
-same keep-alive connection as a tool-call finish. Each such response becomes a
-new *turn* in the chat, and only the messages it added are rendered. If a
-conversation was still split (for example traffic captured before capture was
-running), select the later tab and press `m` to merge it into the one on its
-left.
+Requests are composed into threads, and a response that continues a previous
+one is appended to the same tab instead of opening a new one. The evidence, in
+order:
+
+1. **Declared thread id.** A request header (`x-session-id`, `x-session-affinity`,
+   `session_id`, `x-conversation-id`, `conversation_id`, `x-thread-id`,
+   `thread_id`, `x-chat-id`, `chat_id`) or body field (`prompt_cache_key`,
+   `conversation_id`, `session_id`, `thread_id`, also under `metadata`). Values
+   shorter than 8 characters are ignored as too generic. When a client declares
+   one, it is authoritative: same id merges, different ids never merge, even if
+   the content looks related. The stats panel shows it as `Thread:`.
+2. **Tool-call id.** The new request echoes the assistant `tool_calls` that the
+   previous turn emitted. Works when the previous request was never captured or
+   the client rewrites its history between calls (dynamic system prompts). Ids
+   are unique, so identical-looking parallel sessions stay apart.
+3. **History prefix** followed by tool output.
+4. **Same keep-alive connection** as a tool-call finish, when the request was
+   missed entirely.
+
+Each such response becomes a new *turn* in the chat, and only the messages it
+added are rendered. If a conversation was still split (for example traffic
+captured before capture was running), select the later tab and press `m` to
+merge it into the one on its left.
 
 Keys: `Left/Right` switch chats, `Up/Down` scroll, `End` resumes following,
 `x` closes and forgets a chat, `m` merges the selected chat into the previous
@@ -51,8 +61,9 @@ it took to generate. The active entry is marked and bold. Turn boundaries are
 shown when a chat has more than one turn.
 
 The sticky statistics panel shows the name (when set), model, completion
-state, packet count, flow, token usage, tool-call count, turn count, and
-llama.cpp timing data when those fields are present in the streamed JSON.
+state, packet count, flow, declared thread id, token usage, tool-call count,
+turn count, and llama.cpp timing data when those fields are present in the
+streamed JSON.
 Conversation tabs use the custom name when set, otherwise middle-elided IDs.
 A tab takes the color of the last generated thing: orange for a tool call, gray
 for thinking, white for an answer, and green before any output. The selected tab

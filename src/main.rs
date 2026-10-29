@@ -30,8 +30,18 @@ const MAX_FLOWS: usize = 2000;
 struct Flow {
     request_buf: String,
     response_buf: String,
-    requests: Vec<Value>,
+    requests: Vec<CapturedRequest>,
+    /// Thread key parsed from the current HTTP request's headers, waiting to
+    /// be attached to the body object once it is complete.
+    pending_thread: Option<String>,
     server: Option<String>,
+}
+/// A captured request body plus the explicit thread identity it declared, if
+/// any (headers or body fields).
+#[derive(Clone)]
+struct CapturedRequest {
+    body: Value,
+    thread: Option<String>,
 }
 struct Packet {
     header: String,
@@ -154,17 +164,27 @@ struct Chat {
     model: String,
     backend: Option<String>,
     flow: String,
+    /// Explicit thread identity declared by the client (session header or
+    /// body field), when it sent one. Authoritative over content heuristics.
+    thread: Option<String>,
     turns: Vec<Turn>,
     scroll: u16,
     follow: bool,
 }
 impl Chat {
-    fn new(id: String, request: Option<Value>, model: String, flow: String) -> Self {
+    fn new(
+        id: String,
+        request: Option<Value>,
+        model: String,
+        flow: String,
+        thread: Option<String>,
+    ) -> Self {
         Self {
             name: None,
             model,
             backend: None,
             flow,
+            thread,
             turns: vec![Turn::new(id, request)],
             scroll: 0,
             follow: true,
@@ -333,6 +353,12 @@ impl App {
         let response = direction == Dir::Response;
         let objects = {
             let flow = self.flows.entry(key.clone()).or_default();
+            // The start of an HTTP request carries its headers. A declared
+            // session/conversation id is kept until the body object is parsed,
+            // so it can be attached to that request.
+            if !response && framed_direction(&packet.payload) == Some(Dir::Request) {
+                flow.pending_thread = thread_key_from_headers(&packet.payload);
+            }
             let buf = if response {
                 &mut flow.response_buf
             } else {
@@ -345,7 +371,14 @@ impl App {
         for object in objects {
             if !response && is_request(&object) {
                 let flow = self.flows.get_mut(&key).expect("flow was just inserted");
-                flow.requests.push(object);
+                let thread = flow
+                    .pending_thread
+                    .take()
+                    .or_else(|| thread_key_from_body(&object));
+                flow.requests.push(CapturedRequest {
+                    body: object,
+                    thread,
+                });
                 if flow.requests.len() > 20 {
                     flow.requests.remove(0);
                 }
@@ -374,15 +407,17 @@ impl App {
             }
             index
         } else {
-            let request = self
+            let captured = self
                 .flows
                 .get(flow_key)
                 .and_then(|f| f.requests.last())
                 .cloned();
+            let request = captured.as_ref().map(|c| c.body.clone());
+            let thread = captured.and_then(|c| c.thread);
             // A new response id that continues a previous session after a tool
             // call is another turn of the same conversation: append it instead
             // of opening a new tab.
-            if let Some(index) = self.continuation(flow_key, request.as_ref()) {
+            if let Some(index) = self.continuation(flow_key, request.as_ref(), thread.as_deref()) {
                 let chat = &mut self.chats[index];
                 chat.flow = flow_key.into();
                 chat.turns.push(Turn::new(id.into(), request));
@@ -395,8 +430,13 @@ impl App {
                     .or_else(|| request.as_ref()?.get("model")?.as_str())
                     .unwrap_or("unknown")
                     .into();
-                self.chats
-                    .push(Chat::new(id.into(), request, model, flow_key.into()));
+                self.chats.push(Chat::new(
+                    id.into(),
+                    request,
+                    model,
+                    flow_key.into(),
+                    thread,
+                ));
                 self.status = format!("captured {id}");
                 self.chats.len() - 1
             }
@@ -497,14 +537,27 @@ impl App {
             self.status = format!("auto-cleaned {id} ({reason})");
         }
     }
-    /// Find a chat whose latest turn the new request continues after a tool
-    /// call. The strongest signal is the tool-call id: the new request echoes
-    /// the assistant `tool_calls` that the previous turn emitted, which works
-    /// even when the previous request was never captured (capture started late)
-    /// or when the client rewrites its history between calls (dynamic system
-    /// prompts). When no id is available, fall back to a message-for-message
-    /// prefix match that must be followed by tool output.
-    fn continuation(&self, flow_key: &str, request: Option<&Value>) -> Option<usize> {
+    /// Find the chat a new response belongs to. A declared thread id is
+    /// authoritative. Otherwise the strongest signal is the tool-call id: the
+    /// new request echoes the assistant `tool_calls` that the previous turn
+    /// emitted, which works even when the previous request was never captured
+    /// (capture started late) or when the client rewrites its history between
+    /// calls (dynamic system prompts). When no id is available, fall back to a
+    /// message-for-message prefix match followed by tool output.
+    fn continuation(
+        &self,
+        flow_key: &str,
+        request: Option<&Value>,
+        thread: Option<&str>,
+    ) -> Option<usize> {
+        // An explicit thread identity is authoritative: merge with the chat
+        // that declared it, and never merge across two different declarations.
+        if let Some(thread) = thread {
+            return self
+                .chats
+                .iter()
+                .position(|chat| chat.thread.as_deref() == Some(thread));
+        }
         let Some(request) = request else {
             // The request was not captured. If this response arrives on the
             // very connection whose last response ended with tool calls, it is
@@ -580,6 +633,7 @@ impl App {
         self.selected = index;
         let turns = chat.turns.len();
         let target = &mut self.chats[index];
+        target.thread = target.thread.take().or(chat.thread);
         target.turns.extend(chat.turns);
         target.flow = chat.flow;
         self.status = format!("merged {turns} turns into {}", target.id());
@@ -695,6 +749,72 @@ fn looks_like_llm(payload: &str) -> bool {
         || p.contains("\"messages\"")
         || p.contains("\"completion\"")
         || p.contains("\"tool_calls\"")
+}
+/// Headers a client uses to declare a stable conversation identity. The value
+/// is the same on every request of one thread, unlike response ids.
+const THREAD_HEADERS: &[&str] = &[
+    "x-session-id",
+    "x-session-affinity",
+    "session-id",
+    "session_id",
+    "x-conversation-id",
+    "conversation-id",
+    "conversation_id",
+    "x-thread-id",
+    "thread-id",
+    "thread_id",
+    "x-chat-id",
+    "chat-id",
+    "chat_id",
+];
+/// Body fields some clients use for the same purpose.
+const THREAD_BODY_FIELDS: &[&str] = &[
+    "prompt_cache_key",
+    "conversation_id",
+    "session_id",
+    "thread_id",
+];
+/// Shorter values are too generic to identify a thread (`1`, `default`) and
+/// are ignored, leaving the content heuristics in charge.
+const MIN_THREAD_KEY_LEN: usize = 8;
+
+fn thread_key_from_headers(payload: &str) -> Option<String> {
+    for line in payload.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            break; // end of the header block
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        if !THREAD_HEADERS.contains(&name.as_str()) {
+            continue;
+        }
+        let value = value.trim();
+        if value.len() >= MIN_THREAD_KEY_LEN {
+            // Source-agnostic: a client that switches between a header and a
+            // body field mid-thread keeps the same key.
+            return Some(format!("thread:{value}"));
+        }
+    }
+    None
+}
+
+fn thread_key_from_body(body: &Value) -> Option<String> {
+    fn usable(value: &Value) -> Option<String> {
+        let value = value.as_str()?;
+        (value.len() >= MIN_THREAD_KEY_LEN).then(|| format!("thread:{value}"))
+    }
+    for field in THREAD_BODY_FIELDS {
+        if let Some(key) = body.get(*field).and_then(usable) {
+            return Some(key);
+        }
+    }
+    let metadata = body.get("metadata")?;
+    THREAD_BODY_FIELDS
+        .iter()
+        .find_map(|field| metadata.get(*field).and_then(usable))
 }
 /// First balanced JSON object in `s`, scanning past SSE `data:` prefixes.
 fn first_json(s: &str) -> Option<Value> {
@@ -821,6 +941,9 @@ fn stats_text(c: &Chat) -> String {
         format!("Chunks: {}", c.chunks()),
         format!("Flow: {}", c.flow),
     ]);
+    if let Some(thread) = c.thread.as_deref() {
+        stats.push(format!("Thread: {thread}"));
+    }
     if c.turns.len() > 1 {
         stats.push(format!("Turns: {}", c.turns.len()));
     }
@@ -1569,10 +1692,13 @@ mod tests {
             .entry("client <-> server".into())
             .or_default()
             .requests
-            .push(json!({
-                "model": "qwen3.8",
-                "messages": []
-            }));
+            .push(CapturedRequest {
+                body: json!({
+                    "model": "qwen3.8",
+                    "messages": []
+                }),
+                thread: None,
+            });
         app.response(
             "client <-> server",
             json!({
@@ -1976,6 +2102,162 @@ mod tests {
         assert_eq!(app.chats[0].turns.len(), 2);
     }
 
+    fn request_start(client_port: u16, headers: &[(&str, &str)]) -> Packet {
+        let mut payload = String::from("POST /v1/chat/completions HTTP/1.1\r\n");
+        for (name, value) in headers {
+            payload.push_str(&format!("{name}: {value}\r\n"));
+        }
+        payload.push_str("\r\n");
+        Packet {
+            header: format!("T 127.0.0.1:{client_port} -> 127.0.0.1:8080"),
+            payload,
+        }
+    }
+    fn request_body(client_port: u16, body: Value) -> Packet {
+        Packet {
+            header: format!("T 127.0.0.1:{client_port} -> 127.0.0.1:8080"),
+            payload: body.to_string(),
+        }
+    }
+    fn response_packet(client_port: u16, body: Value) -> Packet {
+        Packet {
+            header: format!("T 127.0.0.1:8080 -> 127.0.0.1:{client_port}"),
+            payload: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn header_thread_id_groups_requests_across_connections() {
+        let mut app = App::new();
+        app.packet(request_start(5000, &[("x-session-id", "thread-abcdefgh")]));
+        app.packet(request_body(
+            5000,
+            json!({"model": "qwen", "messages": [{"role": "user", "content": "start"}]}),
+        ));
+        app.packet(response_packet(
+            5000,
+            json!({"id": "c1", "choices": [{"delta": {"content": "one"}, "finish_reason": "stop"}]}),
+        ));
+        // A separate connection, a different request body, same declared thread.
+        app.packet(request_start(5001, &[("X-Session-Id", "thread-abcdefgh")]));
+        app.packet(request_body(
+            5001,
+            json!({"model": "qwen", "messages": [
+                {"role": "user", "content": "totally different opening"},
+                {"role": "assistant", "content": "one"},
+                {"role": "user", "content": "follow up"}
+            ]}),
+        ));
+        app.packet(response_packet(
+            5001,
+            json!({"id": "c2", "choices": [{"delta": {"content": "two"}, "finish_reason": "stop"}]}),
+        ));
+
+        assert_eq!(
+            app.chats.len(),
+            1,
+            "the declared thread id is authoritative"
+        );
+        assert_eq!(app.chats[0].turns.len(), 2);
+        assert_eq!(
+            app.chats[0].thread.as_deref(),
+            Some("thread:thread-abcdefgh")
+        );
+    }
+
+    #[test]
+    fn different_header_thread_ids_never_merge_even_with_matching_tool_ids() {
+        let mut app = App::new();
+        app.packet(request_start(5000, &[("x-session-id", "thread-aaaaaaaa")]));
+        app.packet(request_body(
+            5000,
+            json!({"model": "qwen", "messages": [{"role": "user", "content": "a"}]}),
+        ));
+        app.packet(response_packet(
+            5000,
+            json!({"id": "c1", "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{}"}}
+            ]}, "finish_reason": "tool_calls"}]}),
+        ));
+        // Same tool-call id, but the client declares another thread.
+        app.packet(request_start(5001, &[("x-session-id", "thread-bbbbbbbb")]));
+        app.packet(request_body(
+            5001,
+            json!({"model": "qwen", "messages": [
+                {"role": "user", "content": "b"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "search", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "found"}
+            ]}),
+        ));
+        app.packet(response_packet(
+            5001,
+            json!({"id": "c2", "choices": [{"delta": {"content": "two"}}]}),
+        ));
+
+        assert_eq!(
+            app.chats.len(),
+            2,
+            "different declared threads must stay apart"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_key_groups_requests_as_a_thread() {
+        let mut app = App::new();
+        let key = "cache-key-12345678";
+        app.packet(request_start(5000, &[]));
+        app.packet(request_body(
+            5000,
+            json!({"model": "qwen", "prompt_cache_key": key, "messages": [{"role": "user", "content": "start"}]}),
+        ));
+        app.packet(response_packet(
+            5000,
+            json!({"id": "c1", "choices": [{"delta": {"content": "one"}}]}),
+        ));
+        app.packet(request_start(5001, &[]));
+        app.packet(request_body(
+            5001,
+            json!({"model": "qwen", "prompt_cache_key": key, "messages": [{"role": "user", "content": "unrelated"}]}),
+        ));
+        app.packet(response_packet(
+            5001,
+            json!({"id": "c2", "choices": [{"delta": {"content": "two"}}]}),
+        ));
+
+        assert_eq!(app.chats.len(), 1);
+        assert_eq!(
+            app.chats[0].thread.as_deref(),
+            Some("thread:cache-key-12345678")
+        );
+    }
+
+    #[test]
+    fn thread_keys_ignore_generic_short_values() {
+        assert_eq!(
+            thread_key_from_headers(
+                "POST /v1/chat/completions HTTP/1.1\r\nx-session-id: abcdefgh\r\n\r\n"
+            ),
+            Some("thread:abcdefgh".into())
+        );
+        assert_eq!(
+            thread_key_from_headers(
+                "POST /v1/chat/completions HTTP/1.1\r\nx-session-id: default\r\n\r\n"
+            ),
+            None
+        );
+        assert_eq!(
+            thread_key_from_body(&json!({"prompt_cache_key": "short"})),
+            None
+        );
+        assert_eq!(
+            thread_key_from_body(&json!({"metadata": {"session_id": "abcdefgh"}})),
+            Some("thread:abcdefgh".into())
+        );
+    }
+
     #[test]
     fn continuation_on_the_same_connection_regroups_when_request_was_missed() {
         let mut app = App::new();
@@ -2048,6 +2330,7 @@ mod tests {
             "g",
             json!({"id": "c2", "choices": [{"delta": {"content": "done"}}]}),
         );
+        app.chats[1].thread = Some("thread:abcdefgh".into());
         app.selected = 1;
         app.merge_prev();
 
@@ -2055,6 +2338,7 @@ mod tests {
         assert_eq!(app.chats[0].turns.len(), 2);
         assert_eq!(app.chats[0].turns[1].id, "c2");
         assert_eq!(app.selected, 0);
+        assert_eq!(app.chats[0].thread.as_deref(), Some("thread:abcdefgh"));
         assert!(app.chats[0].has_id("c2"));
     }
 

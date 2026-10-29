@@ -2134,20 +2134,23 @@ fn handle_event(
                     app.selected = (app.selected + 1) % app.chats.len()
                 }
                 KeyCode::Up => {
-                    if let Some(c) = app.chats.get_mut(app.selected) {
-                        c.follow = false;
-                        c.scroll = c.scroll.saturating_sub(1)
-                    }
+                    let Some(c) = app.chats.get_mut(app.selected) else {
+                        return true;
+                    };
+                    c.follow = false;
+                    c.scroll = c.scroll.saturating_sub(1)
                 }
                 KeyCode::Down => {
-                    if let Some(c) = app.chats.get_mut(app.selected) {
-                        c.scroll = c.scroll.saturating_add(1)
-                    }
+                    let Some(c) = app.chats.get_mut(app.selected) else {
+                        return true;
+                    };
+                    c.scroll = c.scroll.saturating_add(1)
                 }
                 KeyCode::End => {
-                    if let Some(c) = app.chats.get_mut(app.selected) {
-                        c.follow = true
-                    }
+                    let Some(c) = app.chats.get_mut(app.selected) else {
+                        return true;
+                    };
+                    c.follow = true
                 }
                 KeyCode::Char('x') => app.close(),
                 KeyCode::Char('m') => app.merge_prev(),

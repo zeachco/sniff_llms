@@ -1406,14 +1406,7 @@ fn messages_text(messages: &[Value], skip: usize) -> String {
     let mut out = String::new();
     for m in messages.iter().skip(skip) {
         let role = m.get("role").and_then(Value::as_str).unwrap_or("unknown");
-        let content = m
-            .get("content")
-            .map(|v| {
-                v.as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| serde_json::to_string_pretty(v).unwrap_or_default())
-            })
-            .unwrap_or_default();
+        let content = m.get("content").map(|v| text_of(v, true)).unwrap_or_default();
         out.push_str(&format!("[{role}]\n{content}\n"));
         if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
@@ -1437,7 +1430,7 @@ fn request_text(request: Option<&Value>) -> String {
     let Some(r) = request else {
         return "(request began before capture)".into();
     };
-    if let Some(messages) = r.get("messages").and_then(Value::as_array) {
+    if let Some(messages) = request_messages(r) {
         messages_text(messages, 0)
     } else {
         serde_json::to_string_pretty(r).unwrap_or_default()
@@ -1449,10 +1442,8 @@ fn request_delta_text(previous: Option<&Value>, current: Option<&Value>) -> Stri
     let (Some(previous), Some(current)) = (previous, current) else {
         return request_text(current);
     };
-    let (Some(prev), Some(new)) = (
-        previous.get("messages").and_then(Value::as_array),
-        current.get("messages").and_then(Value::as_array),
-    ) else {
+    let (Some(prev), Some(new)) = (request_messages(previous), request_messages(current))
+    else {
         return request_text(Some(current));
     };
     let common = new
@@ -1798,7 +1789,7 @@ fn name_prompt(c: &Chat) -> String {
         .turns
         .first()
         .and_then(|t| t.request.as_ref())
-        .and_then(|r| r.get("messages").and_then(Value::as_array))
+        .and_then(request_messages)
         .and_then(|m| {
             m.iter()
                 .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))

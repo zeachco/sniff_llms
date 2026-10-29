@@ -367,6 +367,18 @@ impl App {
             body_anchors: Vec::new(),
         }
     }
+    /// Create the flow if absent and record which endpoint is the LLM server.
+    fn admit_flow(&mut self, key: &str, direction: Dir, src: &str, dst: &str) {
+        let flow = self.flows.entry(key.to_owned()).or_default();
+        if flow.server.is_none() {
+            flow.server = Some(if direction == Dir::Response {
+                src.to_owned()
+            } else {
+                dst.to_owned()
+            });
+        }
+    }
+
     fn packet(&mut self, packet: Packet) {
         let Some((src, dst)) = parse_header(&packet.header) else {
             return;
@@ -383,14 +395,7 @@ impl App {
                 if !self.flows.contains_key(&key) && self.flows.len() >= MAX_FLOWS {
                     return;
                 }
-                let flow = self.flows.entry(key.clone()).or_default();
-                if flow.server.is_none() {
-                    flow.server = Some(if d == Dir::Response {
-                        src.to_owned()
-                    } else {
-                        dst.to_owned()
-                    });
-                }
+                self.admit_flow(&key, d, src, dst);
                 d
             }
             // Unframed body data. A brand-new flow must identify itself as LLM
@@ -416,14 +421,7 @@ impl App {
                     if self.flows.len() >= MAX_FLOWS {
                         return;
                     }
-                    let flow = self.flows.entry(key.clone()).or_default();
-                    if flow.server.is_none() {
-                        flow.server = Some(if d == Dir::Response {
-                            src.to_owned()
-                        } else {
-                            dst.to_owned()
-                        });
-                    }
+                    self.admit_flow(&key, d, src, dst);
                     d
                 }
             }

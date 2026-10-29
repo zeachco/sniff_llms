@@ -1413,7 +1413,7 @@ fn extract_objects(buffer: &mut String) -> Vec<Value> {
 fn messages_text(messages: &[Value], skip: usize) -> String {
     let mut out = String::new();
     for m in messages.iter().skip(skip) {
-        let role = m.get("role").and_then(Value::as_str).unwrap_or("unknown");
+        let role = str_or(m, "role", "unknown");
         let content = m.get("content").map(|v| text_of(v, true)).unwrap_or_default();
         out.push_str(&format!("[{role}]\n{content}\n"));
         if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
@@ -2047,6 +2047,147 @@ fn restore(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
     );
     let _ = terminal.show_cursor();
 }
+
+/// Handle one terminal event. Returns false when the app should quit.
+fn handle_event(
+    app: &mut App,
+    event: Event,
+    name_tx: &mpsc::Sender<(String, Result<String, String>)>,
+) -> bool {
+    match event {
+        Event::Mouse(mouse) => {
+            match mouse.kind {
+                // A click on the timeline jumps the body to that segment.
+                MouseEventKind::Down(MouseButton::Left)
+                    if app.timeline_area.contains(Position {
+                        x: mouse.column,
+                        y: mouse.row,
+                    }) =>
+                {
+                    let row =
+                        (mouse.row as usize).saturating_sub(app.timeline_area.y as usize + 1);
+                    if let Some(&Some(flat)) = app.timeline_segments.get(row)
+                        && let Some(&anchor) = app.body_anchors.get(flat)
+                        && let Some(c) = app.chats.get_mut(app.selected)
+                    {
+                        c.follow = false;
+                        c.scroll = anchor.min(u16::MAX as usize) as u16;
+                    }
+                }
+                // The wheel over the body scrolls it (and stops following).
+                MouseEventKind::ScrollUp
+                    if app.body_area.contains(Position {
+                        x: mouse.column,
+                        y: mouse.row,
+                    }) =>
+                {
+                    if let Some(c) = app.chats.get_mut(app.selected) {
+                        c.follow = false;
+                        c.scroll = c.scroll.saturating_sub(3);
+                    }
+                }
+                MouseEventKind::ScrollDown
+                    if app.body_area.contains(Position {
+                        x: mouse.column,
+                        y: mouse.row,
+                    }) =>
+                {
+                    if let Some(c) = app.chats.get_mut(app.selected) {
+                        c.scroll = c.scroll.saturating_add(3);
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+        Event::Key(k) => {
+            if k.kind != KeyEventKind::Press {
+                return true;
+            }
+            if app.rename.is_some() {
+                match k.code {
+                    KeyCode::Char(c) => {
+                        if let Some(buf) = app.rename.as_mut() {
+                            buf.push(c)
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(buf) = app.rename.as_mut() {
+                            buf.pop();
+                        }
+                    }
+                    KeyCode::Enter => app.rename_commit(),
+                    KeyCode::Esc => {
+                        app.rename = None;
+                        app.status = "rename cancelled".into();
+                    }
+                    _ => {}
+                }
+                return true;
+            }
+            match k.code {
+                KeyCode::Char('q') => return false,
+                KeyCode::Left if !app.chats.is_empty() => {
+                    app.selected = app.selected.checked_sub(1).unwrap_or(app.chats.len() - 1)
+                }
+                KeyCode::Right if !app.chats.is_empty() => {
+                    app.selected = (app.selected + 1) % app.chats.len()
+                }
+                KeyCode::Up => {
+                    if let Some(c) = app.chats.get_mut(app.selected) {
+                        c.follow = false;
+                        c.scroll = c.scroll.saturating_sub(1)
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(c) = app.chats.get_mut(app.selected) {
+                        c.scroll = c.scroll.saturating_add(1)
+                    }
+                }
+                KeyCode::End => {
+                    if let Some(c) = app.chats.get_mut(app.selected) {
+                        c.follow = true
+                    }
+                }
+                KeyCode::Char('x') => app.close(),
+                KeyCode::Char('m') => app.merge_prev(),
+                KeyCode::Char('g') => app.group(),
+                KeyCode::Char('u') => app.ungroup(),
+                KeyCode::Char('d') => app.dump(),
+                KeyCode::Char('a') => {
+                    app.auto_clean = app.auto_clean.next();
+                    app.status = format!("auto-clean: {}", app.auto_clean.label())
+                }
+                KeyCode::Char('r') => {
+                    if app.chats.is_empty() {
+                        app.status = "no chat to rename".into()
+                    } else {
+                        app.rename = Some(String::new());
+                        app.status = "rename".into()
+                    }
+                }
+                KeyCode::Char('R') => {
+                    let Some(c) = app.chats.get(app.selected) else {
+                        app.status = "no chat to name".into();
+                        return true;
+                    };
+                    let prompt = name_prompt(c);
+                    let id = c.id().to_owned();
+                    let model = env::var("SNIFF_NAMER").unwrap_or_else(|_| "gemma4:e2b".into());
+                    let tx = name_tx.clone();
+                    app.status = format!("ai-naming with {model}…");
+                    thread::spawn(move || {
+                        let res = run_namer(&model, &prompt);
+                        let _ = tx.send((id, res));
+                    });
+                }
+                _ => {}
+            }
+        }
+        _ => return true,
+    }
+    true
+}
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = env::args().collect::<Vec<_>>();
     if args.iter().any(|a| a == "-h" || a == "--help") {
@@ -2092,137 +2233,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !event::poll(Duration::from_millis(33))? {
             continue;
         }
-        match event::read()? {
-            Event::Mouse(mouse) => {
-                match mouse.kind {
-                    // A click on the timeline jumps the body to that segment.
-                    MouseEventKind::Down(MouseButton::Left)
-                        if app.timeline_area.contains(Position {
-                            x: mouse.column,
-                            y: mouse.row,
-                        }) =>
-                    {
-                        let row =
-                            (mouse.row as usize).saturating_sub(app.timeline_area.y as usize + 1);
-                        if let Some(&Some(flat)) = app.timeline_segments.get(row)
-                            && let Some(&anchor) = app.body_anchors.get(flat)
-                            && let Some(c) = app.chats.get_mut(app.selected)
-                        {
-                            c.follow = false;
-                            c.scroll = anchor.min(u16::MAX as usize) as u16;
-                        }
-                    }
-                    // The wheel over the body scrolls it (and stops following).
-                    MouseEventKind::ScrollUp
-                        if app.body_area.contains(Position {
-                            x: mouse.column,
-                            y: mouse.row,
-                        }) =>
-                    {
-                        if let Some(c) = app.chats.get_mut(app.selected) {
-                            c.follow = false;
-                            c.scroll = c.scroll.saturating_sub(3);
-                        }
-                    }
-                    MouseEventKind::ScrollDown
-                        if app.body_area.contains(Position {
-                            x: mouse.column,
-                            y: mouse.row,
-                        }) =>
-                    {
-                        if let Some(c) = app.chats.get_mut(app.selected) {
-                            c.scroll = c.scroll.saturating_add(3);
-                        }
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-            Event::Key(k) => {
-                if k.kind != KeyEventKind::Press {
-                    continue;
-                }
-                if app.rename.is_some() {
-                    match k.code {
-                        KeyCode::Char(c) => {
-                            if let Some(buf) = app.rename.as_mut() {
-                                buf.push(c)
-                            }
-                        }
-                        KeyCode::Backspace => {
-                            if let Some(buf) = app.rename.as_mut() {
-                                buf.pop();
-                            }
-                        }
-                        KeyCode::Enter => app.rename_commit(),
-                        KeyCode::Esc => {
-                            app.rename = None;
-                            app.status = "rename cancelled".into();
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-                match k.code {
-                    KeyCode::Char('q') => break Ok(()),
-                    KeyCode::Left if !app.chats.is_empty() => {
-                        app.selected = app.selected.checked_sub(1).unwrap_or(app.chats.len() - 1)
-                    }
-                    KeyCode::Right if !app.chats.is_empty() => {
-                        app.selected = (app.selected + 1) % app.chats.len()
-                    }
-                    KeyCode::Up => {
-                        if let Some(c) = app.chats.get_mut(app.selected) {
-                            c.follow = false;
-                            c.scroll = c.scroll.saturating_sub(1)
-                        }
-                    }
-                    KeyCode::Down => {
-                        if let Some(c) = app.chats.get_mut(app.selected) {
-                            c.scroll = c.scroll.saturating_add(1)
-                        }
-                    }
-                    KeyCode::End => {
-                        if let Some(c) = app.chats.get_mut(app.selected) {
-                            c.follow = true
-                        }
-                    }
-                    KeyCode::Char('x') => app.close(),
-                    KeyCode::Char('m') => app.merge_prev(),
-                    KeyCode::Char('g') => app.group(),
-                    KeyCode::Char('u') => app.ungroup(),
-                    KeyCode::Char('d') => app.dump(),
-                    KeyCode::Char('a') => {
-                        app.auto_clean = app.auto_clean.next();
-                        app.status = format!("auto-clean: {}", app.auto_clean.label())
-                    }
-                    KeyCode::Char('r') => {
-                        if app.chats.is_empty() {
-                            app.status = "no chat to rename".into()
-                        } else {
-                            app.rename = Some(String::new());
-                            app.status = "rename".into()
-                        }
-                    }
-                    KeyCode::Char('R') => {
-                        let Some(c) = app.chats.get(app.selected) else {
-                            app.status = "no chat to name".into();
-                            continue;
-                        };
-                        let prompt = name_prompt(c);
-                        let id = c.id().to_owned();
-                        let model = env::var("SNIFF_NAMER").unwrap_or_else(|_| "gemma4:e2b".into());
-                        let tx = name_tx.clone();
-                        app.status = format!("ai-naming with {model}…");
-                        thread::spawn(move || {
-                            let res = run_namer(&model, &prompt);
-                            let _ = tx.send((id, res));
-                        });
-                    }
-                    _ => {}
-                }
-            }
-            _ => continue,
+        if !handle_event(&mut app, event::read()?, &name_tx) {
+            break Ok(());
         }
     };
     let _ = capture.kill();

@@ -37,6 +37,9 @@ struct Flow {
     /// Thread key parsed from the current HTTP request's headers, waiting to
     /// be attached to the body object once it is complete.
     pending_thread: Option<String>,
+    /// User-Agent of the current HTTP request, waiting to be attached to the
+    /// body object once it is complete.
+    pending_user_agent: Option<String>,
     server: Option<String>,
 }
 /// A captured request body plus the explicit thread identity it declared, if
@@ -45,6 +48,7 @@ struct Flow {
 struct CapturedRequest {
     body: Value,
     thread: Option<String>,
+    user_agent: Option<String>,
 }
 struct Packet {
     header: String,
@@ -267,6 +271,9 @@ struct Chat {
     /// Explicit thread identity declared by the client (session header or
     /// body field), when it sent one. Authoritative over content heuristics.
     thread: Option<String>,
+    /// User-Agent of the client that sent the first observed request.
+    /// Identifies the caller (e.g. `pi/1.4.0`) without decoding the body.
+    client: Option<String>,
     /// First-turn id of the chat this one was spawned from, when it is a
     /// subagent generation. Such chats are grouped under their parent tab
     /// instead of being merged into its message history.
@@ -284,6 +291,7 @@ impl Chat {
         model: String,
         flow: String,
         thread: Option<String>,
+        client: Option<String>,
     ) -> Self {
         Self {
             name: None,
@@ -291,6 +299,7 @@ impl Chat {
             backend: None,
             flow,
             thread,
+            client,
             parent: None,
             last_activity: Instant::now(),
             turns: vec![Turn::new(id, request)],
@@ -511,6 +520,7 @@ impl App {
             // so it can be attached to that request.
             if !response && framed_direction(&packet.payload) == Some(Dir::Request) {
                 flow.pending_thread = thread_key_from_headers(&packet.payload);
+                flow.pending_user_agent = user_agent_from_headers(&packet.payload);
             }
             let buf = if response {
                 &mut flow.response_buf
@@ -531,6 +541,7 @@ impl App {
                 flow.requests.push(CapturedRequest {
                     body: object,
                     thread,
+                    user_agent: flow.pending_user_agent.take(),
                 });
                 if flow.requests.len() > 20 {
                     flow.requests.remove(0);
@@ -568,6 +579,7 @@ impl App {
                 .and_then(|f| f.requests.last())
                 .cloned();
             let request = captured.as_ref().map(|c| c.body.clone());
+            let client = captured.as_ref().and_then(|c| c.user_agent.clone());
             let thread = captured.and_then(|c| c.thread);
             // A subagent generation is a separate pi process with its own
             // session; never fold it into the parent's message history.
@@ -592,8 +604,14 @@ impl App {
                     .or_else(|| request.as_ref().and_then(|r| str_field(r, "model")))
                     .unwrap_or("unknown")
                     .into();
-                let mut chat =
-                    Chat::new(id.into(), request.clone(), model, flow_key.into(), thread);
+                let mut chat = Chat::new(
+                    id.into(),
+                    request.clone(),
+                    model,
+                    flow_key.into(),
+                    thread,
+                    client,
+                );
                 let parent = self.subagent_parent(request.as_ref());
                 let position = match parent {
                     Some(parent_index) => {
@@ -755,6 +773,9 @@ impl App {
         if chat.thread.is_none() {
             chat.thread = captured.thread;
         }
+        if chat.client.is_none() {
+            chat.client = captured.user_agent;
+        }
         let turn = chat.turns.last_mut().expect("chat has a turn");
         if turn.request.is_none() {
             turn.request = Some(captured.body);
@@ -902,6 +923,7 @@ impl App {
         let target_id = self.chats[index].id().to_owned();
         let target = &mut self.chats[index];
         target.thread = target.thread.take().or(chat.thread);
+        target.client = target.client.take().or(chat.client);
         target.turns.extend(chat.turns);
         target.flow = chat.flow;
         for other in self.chats.iter_mut() {
@@ -1109,6 +1131,24 @@ fn thread_key_from_headers(payload: &str) -> Option<String> {
     }
     None
 }
+/// The request's User-Agent, when the header was captured. Identifies the
+/// calling client (pi version, other agents) without decoding the body.
+fn user_agent_from_headers(payload: &str) -> Option<String> {
+    for line in payload.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            break; // end of the header block
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("user-agent") {
+            let value = value.trim();
+            return (!value.is_empty()).then(|| value.to_owned());
+        }
+    }
+    None
+}
 
 fn thread_key_from_body(body: &Value) -> Option<String> {
     fn usable(value: &str) -> Option<String> {
@@ -1138,13 +1178,16 @@ fn is_subagent_tool(name: &str) -> bool {
 /// spawning extension appends. Normal conversations must not be grouped just
 /// because some parent is waiting on a tool.
 fn looks_like_subagent_request(request: &Value) -> bool {
+    // Match the opening line of each pi-subagents agent profile, which the
+    // harness puts in the child's system prompt.
     let text = request_plain_text(request).to_ascii_lowercase();
     [
-        "you are a scout subagent",
-        "you are a code review subagent",
-        "you are a planning subagent",
-        "you are a worker subagent",
-        "do not expand scope or spawn another subagent",
+        "you are a scout.",
+        "you are the executor.",
+        "you are the planner.",
+        "you are a senior reviewer.",
+        "you are the typing tier",
+        "you are a fast, literal coder.",
     ]
     .iter()
     .any(|marker| text.contains(marker))
@@ -1305,6 +1348,9 @@ fn stats_text(c: &Chat) -> String {
         stats.push(format!("Name: {name}"));
     }
     stats.push(format!("Model: {}", c.model));
+    if let Some(client) = c.client.as_deref() {
+        stats.push(format!("Client: {client}"));
+    }
     if let Some(backend) = c.backend.as_deref() {
         stats.push(format!("Backend: {backend}"));
     }
@@ -2290,6 +2336,7 @@ mod tests {
                     "messages": []
                 }),
                 thread: None,
+                user_agent: None,
             });
         app.response(
             "client <-> server",
@@ -2914,6 +2961,30 @@ mod tests {
     }
 
     #[test]
+    fn request_user_agent_labels_the_chat_and_the_stats_line() {
+        let mut app = App::new();
+        app.packet(request_start(5000, &[("User-Agent", "pi/1.4.0")]));
+        app.packet(request_body(
+            5000,
+            json!({"model": "qwen", "messages": [{"role": "user", "content": "hi"}]}),
+        ));
+        app.response(
+            "127.0.0.1:5000 <-> 127.0.0.1:8080",
+            delta_response("c1", json!({"content": "hello"}), Some("stop")),
+        );
+
+        assert_eq!(app.chats[0].client.as_deref(), Some("pi/1.4.0"));
+        assert!(stats_text(&app.chats[0]).contains("Client: pi/1.4.0"));
+
+        let mut no_agent = App::new();
+        no_agent.response(
+            "client <-> server",
+            delta_response("c2", json!({"content": "x"}), Some("stop")),
+        );
+        assert!(no_agent.chats[0].client.is_none());
+    }
+
+    #[test]
     fn header_thread_id_groups_requests_across_connections() {
         let mut app = App::new();
         app.packet(request_start(5000, &[("x-session-id", "thread-abcdefgh")]));
@@ -3042,6 +3113,24 @@ mod tests {
         assert_eq!(
             thread_key_from_body(&json!({"metadata": {"session_id": "abcdefgh"}})),
             Some("thread:abcdefgh".into())
+        );
+    }
+
+    #[test]
+    fn user_agent_header_is_parsed_from_the_request_block() {
+        assert_eq!(
+            user_agent_from_headers(
+                "POST /v1/chat/completions HTTP/1.1\r\nUser-Agent: pi/1.4.0\r\nHost: x\r\n\r\n"
+            ),
+            Some("pi/1.4.0".into())
+        );
+        assert_eq!(
+            user_agent_from_headers("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n"),
+            None
+        );
+        assert_eq!(
+            user_agent_from_headers("POST /v1/chat/completions HTTP/1.1\r\nUser-Agent:\r\n\r\n"),
+            None
         );
     }
 

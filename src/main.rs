@@ -991,6 +991,31 @@ fn parse_header(s: &str) -> Option<(&str, &str)> {
     (p.next()? == "->").then_some(())?;
     Some((a, p.next()?))
 }
+fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(Value::as_str)
+}
+
+fn str_or<'a>(v: &'a Value, key: &str, default: &'a str) -> &'a str {
+    str_field(v, key).unwrap_or(default)
+}
+
+fn request_messages<'a>(v: &'a Value) -> Option<&'a [Value]> {
+    v.get("messages").and_then(Value::as_array).map(Vec::as_slice)
+}
+
+fn text_of(v: &Value, pretty: bool) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => {
+            if pretty {
+                serde_json::to_string_pretty(other).unwrap_or_default()
+            } else {
+                other.to_string()
+            }
+        }
+    }
+}
+
 fn is_request(v: &Value) -> bool {
     v.get("messages").is_some_and(Value::is_array) || v.get("prompt").is_some_and(Value::is_string)
 }
@@ -1015,7 +1040,7 @@ fn detect_backend(v: &Value) -> Option<&'static str> {
     if v.get("provider_name").is_some() {
         return Some("openrouter");
     }
-    if let Some(id) = v.get("id").and_then(Value::as_str) {
+    if let Some(id) = str_field(v, "id") {
         if id.starts_with("gen-") {
             return Some("openrouter");
         }
@@ -1087,19 +1112,18 @@ fn thread_key_from_headers(payload: &str) -> Option<String> {
 }
 
 fn thread_key_from_body(body: &Value) -> Option<String> {
-    fn usable(value: &Value) -> Option<String> {
-        let value = value.as_str()?;
+    fn usable(value: &str) -> Option<String> {
         (value.len() >= MIN_THREAD_KEY_LEN).then(|| format!("thread:{value}"))
     }
     for field in THREAD_BODY_FIELDS {
-        if let Some(key) = body.get(*field).and_then(usable) {
+        if let Some(key) = str_field(body, field).and_then(usable) {
             return Some(key);
         }
     }
     let metadata = body.get("metadata")?;
     THREAD_BODY_FIELDS
         .iter()
-        .find_map(|field| metadata.get(*field).and_then(usable))
+        .find_map(|field| str_field(metadata, field).and_then(usable))
 }
 
 /// Tool names a harness uses to spawn a child generation. Cindy/pi's subagent
@@ -1130,19 +1154,13 @@ fn looks_like_subagent_request(request: &Value) -> bool {
 /// Unescaped text of a request's messages, for substring matching against the
 /// brief a parent passed to its subagent tool.
 fn request_plain_text(request: &Value) -> String {
-    let Some(messages) = request.get("messages").and_then(Value::as_array) else {
+    let Some(messages) = request_messages(request) else {
         return String::new();
     };
     let mut out = String::new();
     for message in messages {
-        match message.get("content") {
-            Some(Value::String(s)) => out.push_str(s),
-            Some(other) => {
-                if let Ok(s) = serde_json::to_string(other) {
-                    out.push_str(&s);
-                }
-            }
-            None => {}
+        if let Some(content) = message.get("content") {
+            out.push_str(&text_of(content, false));
         }
         out.push('\n');
         if out.len() > 256 * 1024 {

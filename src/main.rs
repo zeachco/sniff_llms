@@ -57,6 +57,12 @@ struct ToolCall {
     arguments: String,
 }
 
+impl ToolCall {
+    fn is_empty(&self) -> bool {
+        self.id.is_empty() && self.name.is_empty() && self.arguments.is_empty()
+    }
+}
+
 /// The three kinds of output a stream can produce. They drive both the
 /// timeline entries and the tab color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1466,7 +1472,7 @@ fn turn_request_text(turns: &[Turn], index: usize) -> String {
 fn tool_calls_text(turn: &Turn) -> String {
     let mut out = String::new();
     for tc in &turn.tool_calls {
-        if tc.id.is_empty() && tc.name.is_empty() && tc.arguments.is_empty() {
+        if tc.is_empty() {
             continue;
         }
         let name: &str = if tc.name.is_empty() {
@@ -1632,7 +1638,7 @@ fn tool_call_line_starts(turn: &Turn) -> Vec<usize> {
     let mut starts = vec![usize::MAX; turn.tool_calls.len()];
     let mut at = 0usize;
     for (i, tc) in turn.tool_calls.iter().enumerate() {
-        if tc.id.is_empty() && tc.name.is_empty() && tc.arguments.is_empty() {
+        if tc.is_empty() {
             continue;
         }
         starts[i] = at;

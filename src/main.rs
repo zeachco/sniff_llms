@@ -2322,11 +2322,11 @@ mod tests {
         let mut app = App::new();
         app.response(
             "client:5000 <-> router:8000",
-            json!({"id": "c1", "choices": [{"delta": {"content": "hello"}}]}),
+            delta_response("c1", json!({"content": "hello"}), None),
         );
         app.response(
             "router:5001 <-> server:9000",
-            json!({"id": "c1", "choices": [{"delta": {"content": "hello"}}]}),
+            delta_response("c1", json!({"content": "hello"}), None),
         );
 
         assert_eq!(app.chats.len(), 1, "same id must have only one tab");
@@ -2397,7 +2397,7 @@ mod tests {
         app.auto_clean = AutoClean::ToolCalls;
         app.response(
             "f",
-            json!({"id": "c1", "choices": [{"delta": {"content": "hi"}, "finish_reason": "tool_calls"}]}),
+            delta_response("c1", json!({"content": "hi"}), Some("tool_calls")),
         );
         assert!(app.chats.is_empty(), "chat should be auto-cleaned");
         assert!(app.ignored.contains("c1"));
@@ -2409,7 +2409,7 @@ mod tests {
         app.auto_clean = AutoClean::Never;
         app.response(
             "f",
-            json!({"id": "c1", "choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+            delta_response("c1", json!({}), Some("tool_calls")),
         );
         assert_eq!(app.chats.len(), 1);
     }
@@ -2419,11 +2419,11 @@ mod tests {
         let mut app = App::new();
         app.response(
             "f",
-            json!({"id": "c1", "choices": [{"delta": {"content": "a"}}]}),
+            delta_response("c1", json!({"content": "a"}), None),
         );
         app.response(
             "f",
-            json!({"id": "c2", "choices": [{"delta": {"content": "b"}}]}),
+            delta_response("c2", json!({"content": "b"}), None),
         );
         assert_eq!(app.selected, 0, "selection should stay on the first chat");
         assert_eq!(app.chats.len(), 2);
@@ -2500,7 +2500,7 @@ mod tests {
         let mut app = App::new();
         app.response(
             "f",
-            json!({"id": "c1", "choices": [{"delta": {"content": "a"}}]}),
+            delta_response("c1", json!({"content": "a"}), None),
         );
         app.rename = Some("my chat".into());
         app.rename_commit();
@@ -2610,33 +2610,23 @@ mod tests {
     #[test]
     fn continuation_after_tool_call_extends_the_same_chat() {
         let mut app = App::new();
-        app.packet(Packet {
-            header: "T 127.0.0.1:5000 -> 127.0.0.1:8080".into(),
-            payload: first_request().to_string(),
-        });
-        app.packet(Packet {
-            header: "T 127.0.0.1:8080 -> 127.0.0.1:5000".into(),
-            payload: json!({
-                "id": "c1",
-                "choices": [{"delta": {"tool_calls": [
+        app.packet(request_body(5000, first_request()));
+        app.packet(response_packet(
+            5000,
+            delta_response(
+                "c1",
+                json!({"tool_calls": [
                     {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{\"q\":\"file\"}"}}
-                ]}, "finish_reason": "tool_calls"}]
-            })
-            .to_string(),
-        });
+                ]}),
+                Some("tool_calls"),
+            ),
+        ));
         // The client comes back on a fresh connection with the tool result.
-        app.packet(Packet {
-            header: "T 127.0.0.1:5001 -> 127.0.0.1:8080".into(),
-            payload: continuation_request().to_string(),
-        });
-        app.packet(Packet {
-            header: "T 127.0.0.1:8080 -> 127.0.0.1:5001".into(),
-            payload: json!({
-                "id": "c2",
-                "choices": [{"delta": {"content": "the file is /tmp/file"}, "finish_reason": "stop"}]
-            })
-            .to_string(),
-        });
+        app.packet(request_body(5001, continuation_request()));
+        app.packet(response_packet(
+            5001,
+            delta_response("c2", json!({"content": "the file is /tmp/file"}), Some("stop")),
+        ));
 
         assert_eq!(app.chats.len(), 1, "continuation must reuse the tab");
         let chat = &app.chats[0];
@@ -2687,7 +2677,7 @@ mod tests {
         });
         app.response(
             "127.0.0.1:5001 <-> 127.0.0.1:8080",
-            json!({"id": "c2", "choices": [{"delta": {"content": "done"}}]}),
+            delta_response("c2", json!({"content": "done"}), None),
         );
 
         assert_eq!(
@@ -2714,6 +2704,13 @@ mod tests {
             header: format!("T 127.0.0.1:{client_port} -> 127.0.0.1:8080"),
             payload: body.to_string(),
         }
+    }
+    fn delta_response(id: &str, delta: Value, finish: Option<&str>) -> Value {
+        let mut choice = json!({ "delta": delta });
+        if let Some(f) = finish {
+            choice["finish_reason"] = json!(f);
+        }
+        json!({ "id": id, "choices": [choice] })
     }
     fn response_packet(client_port: u16, body: Value) -> Packet {
         Packet {
@@ -2745,7 +2742,7 @@ mod tests {
         // subagent tool call on the recent parent.
         app.response(
             "g",
-            json!({"id": "s1", "choices": [{"delta": {"content": "reviewing"}}]}),
+            delta_response("s1", json!({"content": "reviewing"}), None),
         );
 
         assert_eq!(app.chats.len(), 2);
@@ -2776,7 +2773,7 @@ mod tests {
         ));
         app.response(
             "127.0.0.1:5000 <-> 127.0.0.1:8080",
-            json!({"id": "s1", "choices": [{"delta": {"content": "reviewing"}}]}),
+            delta_response("s1", json!({"content": "reviewing"}), None),
         );
 
         let child = app
@@ -2828,13 +2825,13 @@ mod tests {
         app.packet(request_body(5000, next_request("call_s")));
         app.response(
             "127.0.0.1:5000 <-> 127.0.0.1:8080",
-            json!({"id": "c3", "choices": [{"delta": {"content": "child continued"}}]}),
+            delta_response("c3", json!({"content": "child continued"}), None),
         );
         app.packet(request_start(5001, &[]));
         app.packet(request_body(5001, next_request("call_p")));
         app.response(
             "127.0.0.1:5001 <-> 127.0.0.1:8080",
-            json!({"id": "c4", "choices": [{"delta": {"content": "parent continued"}}]}),
+            delta_response("c4", json!({"content": "parent continued"}), None),
         );
 
         assert_eq!(app.chats.len(), 2);
@@ -2858,7 +2855,7 @@ mod tests {
         ));
         app.response(
             "127.0.0.1:5000 <-> 127.0.0.1:8080",
-            json!({"id": "c2", "choices": [{"delta": {"content": "answer"}}]}),
+            delta_response("c2", json!({"content": "answer"}), None),
         );
 
         assert_eq!(app.chats.len(), 2);
@@ -2877,7 +2874,7 @@ mod tests {
         );
         app.response(
             "g",
-            json!({"id": "s1", "choices": [{"delta": {"content": "reviewing"}}]}),
+            delta_response("s1", json!({"content": "reviewing"}), None),
         );
         app.selected = 0;
         app.close();
@@ -2893,7 +2890,7 @@ mod tests {
         // Router backend leg wins the response id first, with no request.
         app.response(
             "backend <-> upstream",
-            json!({"id": "c1", "choices": [{"delta": {"content": "hello"}}]}),
+            delta_response("c1", json!({"content": "hello"}), None),
         );
         assert!(app.chats[0].thread.is_none());
         // Client leg carries the declared session and the request body.
@@ -2904,7 +2901,7 @@ mod tests {
         ));
         app.response(
             "127.0.0.1:5000 <-> 127.0.0.1:8080",
-            json!({"id": "c1", "choices": [{"delta": {"content": "hello"}}]}),
+            delta_response("c1", json!({"content": "hello"}), None),
         );
 
         assert_eq!(app.chats.len(), 1);
@@ -2930,7 +2927,7 @@ mod tests {
         ));
         app.packet(response_packet(
             5000,
-            json!({"id": "c1", "choices": [{"delta": {"content": "one"}, "finish_reason": "stop"}]}),
+            delta_response("c1", json!({"content": "one"}), Some("stop")),
         ));
         // A separate connection, a different request body, same declared thread.
         app.packet(request_start(5001, &[("X-Session-Id", "thread-abcdefgh")]));
@@ -2944,7 +2941,7 @@ mod tests {
         ));
         app.packet(response_packet(
             5001,
-            json!({"id": "c2", "choices": [{"delta": {"content": "two"}, "finish_reason": "stop"}]}),
+            delta_response("c2", json!({"content": "two"}), Some("stop")),
         ));
 
         assert_eq!(
@@ -2988,7 +2985,7 @@ mod tests {
         ));
         app.packet(response_packet(
             5001,
-            json!({"id": "c2", "choices": [{"delta": {"content": "two"}}]}),
+            delta_response("c2", json!({"content": "two"}), None),
         ));
 
         assert_eq!(
@@ -3009,7 +3006,7 @@ mod tests {
         ));
         app.packet(response_packet(
             5000,
-            json!({"id": "c1", "choices": [{"delta": {"content": "one"}}]}),
+            delta_response("c1", json!({"content": "one"}), None),
         ));
         app.packet(request_start(5001, &[]));
         app.packet(request_body(
@@ -3018,7 +3015,7 @@ mod tests {
         ));
         app.packet(response_packet(
             5001,
-            json!({"id": "c2", "choices": [{"delta": {"content": "two"}}]}),
+            delta_response("c2", json!({"content": "two"}), None),
         ));
 
         assert_eq!(app.chats.len(), 1);
@@ -3065,7 +3062,7 @@ mod tests {
         // The follow-up runs on the same keep-alive connection.
         app.response(
             "client <-> server",
-            json!({"id": "c2", "choices": [{"delta": {"content": "done"}}]}),
+            delta_response("c2", json!({"content": "done"}), None),
         );
 
         assert_eq!(
@@ -3102,7 +3099,7 @@ mod tests {
         });
         app.response(
             "127.0.0.1:5002 <-> 127.0.0.1:8080",
-            json!({"id": "c2", "choices": [{"delta": {"content": "done"}}]}),
+            delta_response("c2", json!({"content": "done"}), None),
         );
         assert_eq!(
             app.chats.len(),
@@ -3117,7 +3114,7 @@ mod tests {
         for id in ["a", "b", "c"] {
             app.response(
                 id,
-                json!({"id": id, "choices": [{"delta": {"content": id}}]}),
+                delta_response(id, json!({"content": id}), None),
             );
         }
         // Mark a as the group parent, then attach c to it.
@@ -3159,7 +3156,7 @@ mod tests {
         );
         app.response(
             "g",
-            json!({"id": "c2", "choices": [{"delta": {"content": "done"}}]}),
+            delta_response("c2", json!({"content": "done"}), None),
         );
         app.chats[1].thread = Some("thread:abcdefgh".into());
         app.selected = 1;
@@ -3179,26 +3176,20 @@ mod tests {
         // A chat captured mid-stream has no request to compare against.
         app.response(
             "f",
-            json!({"id": "c0", "choices": [{"delta": {"content": "hi"}}]}),
+            delta_response("c0", json!({"content": "hi"}), None),
         );
         // A second, fully captured chat must still be found after skipping it.
-        app.packet(Packet {
-            header: "T 127.0.0.1:5000 -> 127.0.0.1:8080".into(),
-            payload: first_request().to_string(),
-        });
+        app.packet(request_body(5000, first_request()));
         app.response(
             "127.0.0.1:5000 <-> 127.0.0.1:8080",
             json!({"id": "c1", "choices": [{"delta": {"tool_calls": [
                 {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{}"}}
             ]}, "finish_reason": "tool_calls"}]}),
         );
-        app.packet(Packet {
-            header: "T 127.0.0.1:5001 -> 127.0.0.1:8080".into(),
-            payload: continuation_request().to_string(),
-        });
+        app.packet(request_body(5001, continuation_request()));
         app.response(
             "127.0.0.1:5001 <-> 127.0.0.1:8080",
-            json!({"id": "c2", "choices": [{"delta": {"content": "done"}}]}),
+            delta_response("c2", json!({"content": "done"}), None),
         );
 
         assert_eq!(app.chats.len(), 2, "no extra tab");
@@ -3212,13 +3203,10 @@ mod tests {
     #[test]
     fn a_request_without_tool_output_starts_a_new_chat() {
         let mut app = App::new();
-        app.packet(Packet {
-            header: "T 127.0.0.1:5000 -> 127.0.0.1:8080".into(),
-            payload: first_request().to_string(),
-        });
+        app.packet(request_body(5000, first_request()));
         app.response(
             "a",
-            json!({"id": "c1", "choices": [{"delta": {"content": "hi"}}]}),
+            delta_response("c1", json!({"content": "hi"}), None),
         );
         // Same first message but nothing added: a different conversation, not a continuation.
         app.packet(Packet {
@@ -3234,7 +3222,7 @@ mod tests {
         });
         app.response(
             "b",
-            json!({"id": "c2", "choices": [{"delta": {"content": "yo"}}]}),
+            delta_response("c2", json!({"content": "yo"}), None),
         );
         assert_eq!(app.chats.len(), 2);
     }
@@ -3244,13 +3232,13 @@ mod tests {
         let mut app = App::new();
         app.response(
             "f",
-            json!({"id": "c1", "choices": [{"delta": {"reasoning_content": "pondering"}}]}),
+            delta_response("c1", json!({"reasoning_content": "pondering"}), None),
         );
         assert_eq!(app.chats[0].last().segments.len(), 1);
         assert_eq!(app.chats[0].state_color(), Color::DarkGray);
         app.response(
             "f",
-            json!({"id": "c1", "choices": [{"delta": {"content": "answer"}}]}),
+            delta_response("c1", json!({"content": "answer"}), None),
         );
         app.response(
             "f",
@@ -3284,11 +3272,11 @@ mod tests {
         let mut app = App::new();
         app.response(
             "f",
-            json!({"id": "c1", "choices": [{"delta": {"reasoning_content": "pondering"}}]}),
+            delta_response("c1", json!({"reasoning_content": "pondering"}), None),
         );
         app.response(
             "f",
-            json!({"id": "c1", "choices": [{"delta": {"content": "hello world"}}]}),
+            delta_response("c1", json!({"content": "hello world"}), None),
         );
         app.response(
             "f",
@@ -3323,7 +3311,7 @@ mod tests {
         let mut app = App::new();
         app.response(
             "f",
-            json!({"id": "c1", "choices": [{"delta": {"reasoning_content": "aaaaaaaaaa bbbbbbbbbb cccccccccc"}}]}),
+            delta_response("c1", json!({"reasoning_content": "aaaaaaaaaa bbbbbbbbbb cccccccccc"}), None),
         );
         let chat = &app.chats[0];
         let body = render_body(chat);

@@ -379,10 +379,10 @@ impl App {
                 .get(flow_key)
                 .and_then(|f| f.requests.last())
                 .cloned();
-            // A new response id whose request extends a previous request (and
-            // carries tool output) is the same conversation continuing after a
-            // tool call: append a turn instead of opening a new tab.
-            if let Some(index) = self.continuation(request.as_ref()) {
+            // A new response id that continues a previous session after a tool
+            // call is another turn of the same conversation: append it instead
+            // of opening a new tab.
+            if let Some(index) = self.continuation(flow_key, request.as_ref()) {
                 let chat = &mut self.chats[index];
                 chat.flow = flow_key.into();
                 chat.turns.push(Turn::new(id.into(), request));
@@ -498,65 +498,91 @@ impl App {
         }
     }
     /// Find a chat whose latest turn the new request continues after a tool
-    /// call. The new request must extend the old one message-for-message, and
-    /// the appended messages must carry tool output. Matching tool-call ids
-    /// disambiguates between identical-looking parallel sessions.
-    fn continuation(&self, request: Option<&Value>) -> Option<usize> {
-        let new_msgs = request?.get("messages")?.as_array()?;
-        let mut best: Option<(usize, usize)> = None;
+    /// call. The strongest signal is the tool-call id: the new request echoes
+    /// the assistant `tool_calls` that the previous turn emitted, which works
+    /// even when the previous request was never captured (capture started late)
+    /// or when the client rewrites its history between calls (dynamic system
+    /// prompts). When no id is available, fall back to a message-for-message
+    /// prefix match that must be followed by tool output.
+    fn continuation(&self, flow_key: &str, request: Option<&Value>) -> Option<usize> {
+        let Some(request) = request else {
+            // The request was not captured. If this response arrives on the
+            // very connection whose last response ended with tool calls, it is
+            // the tool round trip: HTTP/1.1 keep-alive serialises requests, so
+            // there is no competing session on that connection.
+            return self.chats.iter().rposition(|chat| {
+                chat.flow == flow_key
+                    && (chat.last().finish.as_deref() == Some("tool_calls")
+                        || !chat.last().tool_calls.is_empty())
+            });
+        };
+        let new_msgs = request.get("messages")?.as_array()?;
+        let request_ids: HashSet<&str> = new_msgs
+            .iter()
+            .filter_map(|m| m.get("tool_calls").and_then(Value::as_array))
+            .flatten()
+            .filter_map(|call| call.get("id").and_then(Value::as_str))
+            .collect();
+        let mut best: Option<((usize, usize), usize)> = None;
         for (index, chat) in self.chats.iter().enumerate() {
             let turn = chat.last();
-            let Some(prev_msgs) = turn
-                .request
-                .as_ref()
-                .and_then(|r| r.get("messages"))
-                .and_then(Value::as_array)
-            else {
-                continue;
-            };
-            if prev_msgs.is_empty() || new_msgs.len() <= prev_msgs.len() {
-                continue;
-            }
-            if !new_msgs
-                .iter()
-                .zip(prev_msgs)
-                .all(|(new, prev)| new == prev)
-            {
-                continue;
-            }
-            let appended = &new_msgs[prev_msgs.len()..];
             let tool_ids: HashSet<&str> = turn
                 .tool_calls
                 .iter()
                 .map(|tc| tc.id.as_str())
                 .filter(|id| !id.is_empty())
                 .collect();
-            let has_tool_output = appended.iter().any(|m| {
-                m.get("role").and_then(Value::as_str) == Some("tool")
-                    || m.get("tool_calls").is_some()
-            });
-            if !has_tool_output {
+            let id_matches = tool_ids.intersection(&request_ids).count();
+            let prefix_len = turn
+                .request
+                .as_ref()
+                .and_then(|r| r.get("messages"))
+                .and_then(Value::as_array)
+                .filter(|prev| {
+                    !prev.is_empty()
+                        && new_msgs.len() > prev.len()
+                        && new_msgs
+                            .iter()
+                            .zip(prev.iter())
+                            .all(|(new, prev)| new == prev)
+                })
+                .map_or(0, |prev| prev.len());
+            if id_matches == 0 && prefix_len == 0 {
                 continue;
             }
-            let id_match = appended.iter().any(|m| {
-                m.get("tool_calls")
-                    .and_then(Value::as_array)
-                    .is_some_and(|calls| {
-                        calls.iter().any(|call| {
-                            call.get("id")
-                                .and_then(Value::as_str)
-                                .is_some_and(|id| tool_ids.contains(id))
-                        })
-                    })
-            });
-            let score = prev_msgs.len() * 4
-                + usize::from(id_match) * 2
-                + usize::from(turn.finish.as_deref() == Some("tool_calls"));
+            // A prefix-only match could be a different conversation that shares
+            // a common opening: require tool output right after the prefix.
+            if id_matches == 0
+                && !new_msgs[prefix_len..].iter().any(|m| {
+                    m.get("role").and_then(Value::as_str) == Some("tool")
+                        || m.get("tool_calls").is_some()
+                })
+            {
+                continue;
+            }
+            let score = (id_matches, prefix_len);
             if best.is_none_or(|(best_score, _)| score >= best_score) {
                 best = Some((score, index));
             }
         }
         best.map(|(_, index)| index)
+    }
+    /// Manually regroup: append the selected chat to the one on its left as a
+    /// continuation. A safety net for conversations whose requests and
+    /// tool-call ids were both missed by the capture.
+    fn merge_prev(&mut self) {
+        if self.selected == 0 {
+            self.status = "nothing on the left to merge into".into();
+            return;
+        }
+        let chat = self.chats.remove(self.selected);
+        let index = self.selected - 1;
+        self.selected = index;
+        let turns = chat.turns.len();
+        let target = &mut self.chats[index];
+        target.turns.extend(chat.turns);
+        target.flow = chat.flow;
+        self.status = format!("merged {turns} turns into {}", target.id());
     }
     fn close(&mut self) {
         self.close_at(self.selected)
@@ -1370,6 +1396,8 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 Span::raw(" scroll "),
                 key("x"),
                 Span::raw(" close "),
+                key("m"),
+                Span::raw(" merge "),
                 key("d"),
                 Span::raw(" dump "),
                 key("a"),
@@ -1485,6 +1513,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 KeyCode::Char('x') => app.close(),
+                KeyCode::Char('m') => app.merge_prev(),
                 KeyCode::Char('d') => app.dump(),
                 KeyCode::Char('a') => {
                     app.auto_clean = app.auto_clean.next();
@@ -1904,6 +1933,129 @@ mod tests {
             1,
             "history is not repeated"
         );
+    }
+
+    #[test]
+    fn continuation_matches_by_tool_call_id_without_a_previous_request() {
+        let mut app = App::new();
+        // The previous request was never captured (capture started mid-flight).
+        app.response(
+            "f",
+            json!({"id": "c1", "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{}"}}
+            ]}, "finish_reason": "tool_calls"}]}),
+        );
+        // The new request has different leading messages (dynamic system
+        // prompt) but echoes the tool-call id emitted by turn 1.
+        app.packet(Packet {
+            header: "T 127.0.0.1:5001 -> 127.0.0.1:8080".into(),
+            payload: json!({
+                "model": "qwen",
+                "messages": [
+                    {"role": "system", "content": "context changed"},
+                    {"role": "user", "content": "find the file"},
+                    {"role": "assistant", "content": null, "tool_calls": [{
+                        "id": "call_1", "type": "function",
+                        "function": {"name": "search", "arguments": "{}"}
+                    }]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": "found"}
+                ]
+            })
+            .to_string(),
+        });
+        app.response(
+            "127.0.0.1:5001 <-> 127.0.0.1:8080",
+            json!({"id": "c2", "choices": [{"delta": {"content": "done"}}]}),
+        );
+
+        assert_eq!(
+            app.chats.len(),
+            1,
+            "the tool-call id must regroup the session"
+        );
+        assert_eq!(app.chats[0].turns.len(), 2);
+    }
+
+    #[test]
+    fn continuation_on_the_same_connection_regroups_when_request_was_missed() {
+        let mut app = App::new();
+        // Only the response side was captured.
+        app.response(
+            "client <-> server",
+            json!({"id": "c1", "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{}"}}
+            ]}, "finish_reason": "tool_calls"}]}),
+        );
+        // The follow-up runs on the same keep-alive connection.
+        app.response(
+            "client <-> server",
+            json!({"id": "c2", "choices": [{"delta": {"content": "done"}}]}),
+        );
+
+        assert_eq!(
+            app.chats.len(),
+            1,
+            "same connection after tool calls = one session"
+        );
+        assert_eq!(app.chats[0].turns.len(), 2);
+    }
+
+    #[test]
+    fn unrelated_tool_call_ids_start_a_new_chat() {
+        let mut app = App::new();
+        app.response(
+            "f",
+            json!({"id": "c1", "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{}"}}
+            ]}, "finish_reason": "tool_calls"}]}),
+        );
+        app.packet(Packet {
+            header: "T 127.0.0.1:5002 -> 127.0.0.1:8080".into(),
+            payload: json!({
+                "model": "qwen",
+                "messages": [
+                    {"role": "user", "content": "another task"},
+                    {"role": "assistant", "content": null, "tool_calls": [{
+                        "id": "call_2", "type": "function",
+                        "function": {"name": "search", "arguments": "{}"}
+                    }]},
+                    {"role": "tool", "tool_call_id": "call_2", "content": "found"}
+                ]
+            })
+            .to_string(),
+        });
+        app.response(
+            "127.0.0.1:5002 <-> 127.0.0.1:8080",
+            json!({"id": "c2", "choices": [{"delta": {"content": "done"}}]}),
+        );
+        assert_eq!(
+            app.chats.len(),
+            2,
+            "a different tool id is a different session"
+        );
+    }
+
+    #[test]
+    fn merge_prev_regroups_two_open_chats() {
+        let mut app = App::new();
+        app.response(
+            "f",
+            json!({"id": "c1", "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{}"}}
+            ]}, "finish_reason": "tool_calls"}]}),
+        );
+        app.response(
+            "g",
+            json!({"id": "c2", "choices": [{"delta": {"content": "done"}}]}),
+        );
+        app.selected = 1;
+        app.merge_prev();
+
+        assert_eq!(app.chats.len(), 1);
+        assert_eq!(app.chats[0].turns.len(), 2);
+        assert_eq!(app.chats[0].turns[1].id, "c2");
+        assert_eq!(app.selected, 0);
+        assert!(app.chats[0].has_id("c2"));
     }
 
     #[test]

@@ -25,15 +25,22 @@ observed flow owns one conversation tab and chunks from the other legs are
 ignored, preventing duplicated streamed output.
 
 A response that continues a previous one after a tool call is composed into
-the same tab instead of opening a new one. A new response id is matched to an
-open chat when its request repeats the chat's last request message-for-message
-and the appended messages carry tool output (a `tool` role or an assistant
-`tool_calls` entry). Tool-call ids disambiguate identical-looking parallel
-sessions. Each such response becomes a new *turn* in the chat, and only the
-messages it added are rendered.
+the same tab instead of opening a new one. The primary signal is the tool-call
+id: the new request echoes the assistant `tool_calls` that the previous turn
+emitted, which works even when the previous request was never captured or the
+client rewrites its history between calls (dynamic system prompts). Ids are
+unique, so identical-looking parallel sessions stay apart. When no id was
+captured, the fallback is a message-for-message prefix match followed by tool
+output, then — when the request itself was missed — a response arriving on the
+same keep-alive connection as a tool-call finish. Each such response becomes a
+new *turn* in the chat, and only the messages it added are rendered. If a
+conversation was still split (for example traffic captured before capture was
+running), select the later tab and press `m` to merge it into the one on its
+left.
 
 Keys: `Left/Right` switch chats, `Up/Down` scroll, `End` resumes following,
-`x` closes and forgets a chat, `d` writes `~/chat-id-{id}.log`, `a` cycles the
+`x` closes and forgets a chat, `m` merges the selected chat into the previous
+one as a continuation, `d` writes `~/chat-id-{id}.log`, `a` cycles the
 auto-clean rule, `r` renames the current chat (`Enter` saves, `Esc` cancels,
 blank clears), `R` asks a local model for a short name, and `q` quits.
 

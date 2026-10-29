@@ -24,19 +24,33 @@ router mirrors the same response ID across multiple port pairs, the first
 observed flow owns one conversation tab and chunks from the other legs are
 ignored, preventing duplicated streamed output.
 
+A response that continues a previous one after a tool call is composed into
+the same tab instead of opening a new one. A new response id is matched to an
+open chat when its request repeats the chat's last request message-for-message
+and the appended messages carry tool output (a `tool` role or an assistant
+`tool_calls` entry). Tool-call ids disambiguate identical-looking parallel
+sessions. Each such response becomes a new *turn* in the chat, and only the
+messages it added are rendered.
+
 Keys: `Left/Right` switch chats, `Up/Down` scroll, `End` resumes following,
 `x` closes and forgets a chat, `d` writes `~/chat-id-{id}.log`, `a` cycles the
 auto-clean rule, `r` renames the current chat (`Enter` saves, `Esc` cancels,
 blank clears), `R` asks a local model for a short name, and `q` quits.
 
+The left column is a timeline of the selected chat: one entry per generated
+run of **thinking**, **answer**, or **tool** call, in generation order. Each
+entry shows its estimated token count (from characters) and the wall-clock time
+it took to generate. The active entry is marked and bold. Turn boundaries are
+shown when a chat has more than one turn.
+
 The sticky statistics panel shows the name (when set), model, completion
-state, packet count, flow, token usage, tool-call count, and llama.cpp timing
-data when those fields are present in the streamed JSON. Conversation tabs use
-the custom name when set, otherwise middle-elided IDs, and color their state:
-green while streaming, gray when waiting on tool calls, and red when stopped by
-length or a content filter. The selected tab is underlined. When the tabs are
-wider than the terminal, the bar windows around the selected one and shows a
-`+N` count on either side for the hidden tabs.
+state, packet count, flow, token usage, tool-call count, turn count, and
+llama.cpp timing data when those fields are present in the streamed JSON.
+Conversation tabs use the custom name when set, otherwise middle-elided IDs.
+A tab takes the color of the last generated thing: orange for a tool call, gray
+for thinking, white for an answer, and green before any output. The selected tab
+is underlined. When the tabs are wider than the terminal, the bar windows around
+the selected one and shows a `+N` count on either side for the hidden tabs.
 
 New chats never steal the selection; they are appended and shown in the tab
 bar, and the status line records their captured ID.

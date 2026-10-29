@@ -21,7 +21,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const MAX_FLOWS: usize = 2000;
@@ -43,22 +43,166 @@ struct ToolCall {
     name: String,
     arguments: String,
 }
-struct Chat {
+
+/// The three kinds of output a stream can produce. They drive both the
+/// timeline entries and the tab color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegKind {
+    Thinking,
+    Answer,
+    Tool,
+}
+impl SegKind {
+    fn label(self) -> &'static str {
+        match self {
+            SegKind::Thinking => "thinking",
+            SegKind::Answer => "answer",
+            SegKind::Tool => "tool",
+        }
+    }
+    fn color(self) -> Color {
+        match self {
+            SegKind::Thinking => Color::DarkGray,
+            SegKind::Answer => Color::White,
+            SegKind::Tool => Color::Rgb(255, 165, 0),
+        }
+    }
+}
+
+/// One contiguous run of output of a single kind, with the wall-clock time it
+/// took to generate. Token counts are estimated from characters because the
+/// streamed chunks never carry per-chunk token counts.
+struct Segment {
+    kind: SegKind,
+    chars: usize,
+    started: Instant,
+    ended: Option<Instant>,
+}
+impl Segment {
+    fn tokens(&self) -> usize {
+        self.chars.div_ceil(4)
+    }
+    fn duration(&self) -> Duration {
+        self.ended
+            .unwrap_or_else(Instant::now)
+            .saturating_duration_since(self.started)
+    }
+}
+
+/// One HTTP response (one response id) inside a conversation. A chat can hold
+/// several turns when the client continues after a tool call with a new id.
+struct Turn {
     id: String,
-    name: Option<String>,
-    model: String,
-    backend: Option<String>,
-    flow: String,
     request: Option<Value>,
     reasoning: String,
     answer: String,
     tool_calls: Vec<ToolCall>,
     finish: Option<String>,
-    scroll: u16,
-    follow: bool,
     chunks: usize,
     usage: Option<Value>,
     timings: Option<Value>,
+    segments: Vec<Segment>,
+}
+impl Turn {
+    fn new(id: String, request: Option<Value>) -> Self {
+        Self {
+            id,
+            request,
+            reasoning: String::new(),
+            answer: String::new(),
+            tool_calls: Vec::new(),
+            finish: None,
+            chunks: 0,
+            usage: None,
+            timings: None,
+            segments: Vec::new(),
+        }
+    }
+    /// Extend the active segment of `kind`, or close the previous one and start
+    /// a new segment when the kind changes.
+    fn push(&mut self, kind: SegKind, text: &str) {
+        let chars = text.chars().count();
+        if chars == 0 {
+            return;
+        }
+        if let Some(last) = self.segments.last_mut()
+            && last.kind == kind
+            && last.ended.is_none()
+        {
+            last.chars += chars;
+            return;
+        }
+        if let Some(last) = self.segments.last_mut() {
+            last.ended.get_or_insert_with(Instant::now);
+        }
+        self.segments.push(Segment {
+            kind,
+            chars,
+            started: Instant::now(),
+            ended: None,
+        });
+    }
+    fn close_active(&mut self) {
+        if let Some(last) = self.segments.last_mut() {
+            last.ended.get_or_insert_with(Instant::now);
+        }
+    }
+}
+
+struct Chat {
+    name: Option<String>,
+    model: String,
+    backend: Option<String>,
+    flow: String,
+    turns: Vec<Turn>,
+    scroll: u16,
+    follow: bool,
+}
+impl Chat {
+    fn new(id: String, request: Option<Value>, model: String, flow: String) -> Self {
+        Self {
+            name: None,
+            model,
+            backend: None,
+            flow,
+            turns: vec![Turn::new(id, request)],
+            scroll: 0,
+            follow: true,
+        }
+    }
+    fn id(&self) -> &str {
+        &self.turns[0].id
+    }
+    fn last(&self) -> &Turn {
+        self.turns
+            .last()
+            .expect("a chat always has at least one turn")
+    }
+    fn has_id(&self, id: &str) -> bool {
+        self.turns.iter().any(|t| t.id == id)
+    }
+    fn finish(&self) -> Option<&str> {
+        self.last().finish.as_deref()
+    }
+    fn chunks(&self) -> usize {
+        self.turns.iter().map(|t| t.chunks).sum()
+    }
+    fn tool_calls(&self) -> impl Iterator<Item = &ToolCall> {
+        self.turns.iter().flat_map(|t| t.tool_calls.iter())
+    }
+    fn usage(&self) -> Option<&Value> {
+        self.turns.iter().rev().find_map(|t| t.usage.as_ref())
+    }
+    fn timings(&self) -> Option<&Value> {
+        self.turns.iter().rev().find_map(|t| t.timings.as_ref())
+    }
+    /// Color of the last generated thing, for the tab bar.
+    fn state_color(&self) -> Color {
+        self.last()
+            .segments
+            .last()
+            .map_or(Color::Green, |s| s.kind.color())
+    }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AutoClean {
@@ -143,7 +287,11 @@ impl App {
                 }
                 let flow = self.flows.entry(key.clone()).or_default();
                 if flow.server.is_none() {
-                    flow.server = Some(if d == Dir::Response { src.to_owned() } else { dst.to_owned() });
+                    flow.server = Some(if d == Dir::Response {
+                        src.to_owned()
+                    } else {
+                        dst.to_owned()
+                    });
                 }
                 d
             }
@@ -172,7 +320,11 @@ impl App {
                     }
                     let flow = self.flows.entry(key.clone()).or_default();
                     if flow.server.is_none() {
-                        flow.server = Some(if d == Dir::Response { src.to_owned() } else { dst.to_owned() });
+                        flow.server = Some(if d == Dir::Response {
+                            src.to_owned()
+                        } else {
+                            dst.to_owned()
+                        });
                     }
                     d
                 }
@@ -216,7 +368,7 @@ impl App {
         // chat per response id and let the first observed flow own it. Chunks
         // mirrored on another router leg must not create a second tab or append
         // every streamed token a second time.
-        let index = if let Some(index) = self.chats.iter().position(|c| c.id == id) {
+        let index = if let Some(index) = self.chats.iter().position(|c| c.has_id(id)) {
             if self.chats[index].flow != flow_key {
                 return;
             }
@@ -227,31 +379,27 @@ impl App {
                 .get(flow_key)
                 .and_then(|f| f.requests.last())
                 .cloned();
-            let model = value
-                .get("model")
-                .and_then(Value::as_str)
-                .or_else(|| request.as_ref()?.get("model")?.as_str())
-                .unwrap_or("unknown")
-                .into();
-            self.chats.push(Chat {
-                id: id.into(),
-                name: None,
-                model,
-                backend: detect_backend(&value).map(str::to_string),
-                flow: flow_key.into(),
-                request,
-                reasoning: String::new(),
-                answer: String::new(),
-                tool_calls: Vec::new(),
-                finish: None,
-                scroll: 0,
-                follow: true,
-                chunks: 0,
-                usage: None,
-                timings: None,
-            });
-            self.status = format!("captured {id}");
-            self.chats.len() - 1
+            // A new response id whose request extends a previous request (and
+            // carries tool output) is the same conversation continuing after a
+            // tool call: append a turn instead of opening a new tab.
+            if let Some(index) = self.continuation(request.as_ref()) {
+                let chat = &mut self.chats[index];
+                chat.flow = flow_key.into();
+                chat.turns.push(Turn::new(id.into(), request));
+                self.status = format!("continued {} → {id}", chat.id());
+                index
+            } else {
+                let model = value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .or_else(|| request.as_ref()?.get("model")?.as_str())
+                    .unwrap_or("unknown")
+                    .into();
+                self.chats
+                    .push(Chat::new(id.into(), request, model, flow_key.into()));
+                self.status = format!("captured {id}");
+                self.chats.len() - 1
+            }
         };
         let chat = &mut self.chats[index];
         if let Some(model) = value.get("model").and_then(Value::as_str) {
@@ -260,77 +408,155 @@ impl App {
         if let Some(backend) = detect_backend(&value) {
             chat.backend = Some(backend.to_string());
         }
-        if let Some(usage) = value.get("usage") {
-            chat.usage = Some(usage.clone());
-        }
-        if let Some(timings) = value.get("timings") {
-            chat.timings = Some(timings.clone());
-        }
-        chat.chunks += 1;
-        let Some(choice) = value.pointer("/choices/0") else {
-            return;
-        };
-        let delta = choice.get("delta").or_else(|| choice.get("message"));
-        if let Some(s) = delta
-            .and_then(|v| v.get("reasoning_content"))
-            .and_then(Value::as_str)
         {
-            chat.reasoning.push_str(s);
-        }
-        if let Some(s) = delta.and_then(|v| v.get("content")).and_then(Value::as_str) {
-            chat.answer.push_str(s);
-        }
-        if let Some(calls) = delta.and_then(|v| v.get("tool_calls")).and_then(Value::as_array) {
-            for (pos, call) in calls.iter().enumerate() {
-                // Tool-call arguments stream as many small deltas; concatenate them
-                // per call (keyed by the delta `index`) instead of one line each.
-                let idx = call
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .map(|i| i as usize)
-                    .unwrap_or(pos);
-                while chat.tool_calls.len() <= idx {
-                    chat.tool_calls.push(ToolCall::default());
-                }
-                let tc = &mut chat.tool_calls[idx];
-                if tc.id.is_empty() {
-                    tc.id = call
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .unwrap_or_default();
-                }
-                if tc.name.is_empty() {
-                    tc.name = call
-                        .pointer("/function/name")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .unwrap_or_default();
-                }
-                if let Some(args) = call.pointer("/function/arguments") {
-                    let frag = match args {
-                        Value::String(s) => s.clone(),
-                        other => serde_json::to_string(other).unwrap_or_default(),
-                    };
-                    tc.arguments.push_str(&frag);
+            let turn = chat.turns.last_mut().expect("chat has a turn");
+            if let Some(usage) = value.get("usage") {
+                turn.usage = Some(usage.clone());
+            }
+            if let Some(timings) = value.get("timings") {
+                turn.timings = Some(timings.clone());
+            }
+            turn.chunks += 1;
+            let Some(choice) = value.pointer("/choices/0") else {
+                return;
+            };
+            let delta = choice.get("delta").or_else(|| choice.get("message"));
+            if let Some(s) = delta
+                .and_then(|v| v.get("reasoning_content"))
+                .and_then(Value::as_str)
+            {
+                turn.reasoning.push_str(s);
+                turn.push(SegKind::Thinking, s);
+            }
+            if let Some(s) = delta.and_then(|v| v.get("content")).and_then(Value::as_str) {
+                turn.answer.push_str(s);
+                turn.push(SegKind::Answer, s);
+            }
+            if let Some(calls) = delta
+                .and_then(|v| v.get("tool_calls"))
+                .and_then(Value::as_array)
+            {
+                for (pos, call) in calls.iter().enumerate() {
+                    // Tool-call arguments stream as many small deltas; concatenate them
+                    // per call (keyed by the delta `index`) instead of one line each.
+                    let idx = call
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .map(|i| i as usize)
+                        .unwrap_or(pos);
+                    while turn.tool_calls.len() <= idx {
+                        turn.tool_calls.push(ToolCall::default());
+                    }
+                    let mut label = String::new();
+                    {
+                        let tc = &mut turn.tool_calls[idx];
+                        if tc.id.is_empty() {
+                            tc.id = call
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                                .unwrap_or_default();
+                        }
+                        if tc.name.is_empty() {
+                            tc.name = call
+                                .pointer("/function/name")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                                .unwrap_or_default();
+                            label.push_str(&tc.name);
+                        }
+                    }
+                    if let Some(args) = call.pointer("/function/arguments") {
+                        let frag = match args {
+                            Value::String(s) => s.clone(),
+                            other => serde_json::to_string(other).unwrap_or_default(),
+                        };
+                        if !frag.is_empty() && !label.is_empty() {
+                            label.push(' ');
+                        }
+                        label.push_str(&frag);
+                        turn.tool_calls[idx].arguments.push_str(&frag);
+                    }
+                    // Count the tool name too, so a call with empty arguments
+                    // still produces a tool segment (and turns the tab orange).
+                    turn.push(SegKind::Tool, &label);
                 }
             }
-        }
-        if let Some(s) = choice.get("finish_reason").and_then(Value::as_str) {
-            chat.finish = Some(s.into());
+            if let Some(s) = choice.get("finish_reason").and_then(Value::as_str) {
+                turn.finish = Some(s.into());
+                turn.close_active();
+            }
         }
         let auto = {
             let chat = &self.chats[index];
-            chat
-                .finish
-                .as_deref()
-                .and_then(|f| self.auto_clean.action_for(f))
+            chat.finish().and_then(|f| self.auto_clean.action_for(f))
         };
         if let Some(reason) = auto {
-            let id = self.chats[index].id.clone();
+            let id = self.chats[index].id().to_owned();
             self.close_at(index);
             self.status = format!("auto-cleaned {id} ({reason})");
         }
+    }
+    /// Find a chat whose latest turn the new request continues after a tool
+    /// call. The new request must extend the old one message-for-message, and
+    /// the appended messages must carry tool output. Matching tool-call ids
+    /// disambiguates between identical-looking parallel sessions.
+    fn continuation(&self, request: Option<&Value>) -> Option<usize> {
+        let new_msgs = request?.get("messages")?.as_array()?;
+        let mut best: Option<(usize, usize)> = None;
+        for (index, chat) in self.chats.iter().enumerate() {
+            let turn = chat.last();
+            let Some(prev_msgs) = turn
+                .request
+                .as_ref()
+                .and_then(|r| r.get("messages"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            if prev_msgs.is_empty() || new_msgs.len() <= prev_msgs.len() {
+                continue;
+            }
+            if !new_msgs
+                .iter()
+                .zip(prev_msgs)
+                .all(|(new, prev)| new == prev)
+            {
+                continue;
+            }
+            let appended = &new_msgs[prev_msgs.len()..];
+            let tool_ids: HashSet<&str> = turn
+                .tool_calls
+                .iter()
+                .map(|tc| tc.id.as_str())
+                .filter(|id| !id.is_empty())
+                .collect();
+            let has_tool_output = appended.iter().any(|m| {
+                m.get("role").and_then(Value::as_str) == Some("tool")
+                    || m.get("tool_calls").is_some()
+            });
+            if !has_tool_output {
+                continue;
+            }
+            let id_match = appended.iter().any(|m| {
+                m.get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| {
+                        calls.iter().any(|call| {
+                            call.get("id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| tool_ids.contains(id))
+                        })
+                    })
+            });
+            let score = prev_msgs.len() * 4
+                + usize::from(id_match) * 2
+                + usize::from(turn.finish.as_deref() == Some("tool_calls"));
+            if best.is_none_or(|(best_score, _)| score >= best_score) {
+                best = Some((score, index));
+            }
+        }
+        best.map(|(_, index)| index)
     }
     fn close(&mut self) {
         self.close_at(self.selected)
@@ -340,7 +566,9 @@ impl App {
             return;
         }
         let chat = self.chats.remove(index);
-        self.ignored.insert(chat.id.clone());
+        for turn in &chat.turns {
+            self.ignored.insert(turn.id.clone());
+        }
         if let Some(flow) = self.flows.get_mut(&chat.flow) {
             flow.requests.clear();
             flow.request_buf.clear();
@@ -354,7 +582,7 @@ impl App {
             }
             self.selected = self.selected.min(self.chats.len() - 1);
         }
-        self.status = format!("closed and forgot {}", chat.id);
+        self.status = format!("closed and forgot {}", chat.id());
     }
     fn dump(&mut self) {
         let Some(chat) = self.chats.get(self.selected) else {
@@ -363,7 +591,7 @@ impl App {
         let path = env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| ".".into())
-            .join(format!("chat-id-{}.log", safe_name(&chat.id)));
+            .join(format!("chat-id-{}.log", safe_name(chat.id())));
         self.status =
             match File::create(&path).and_then(|mut f| f.write_all(render_chat(chat).as_bytes())) {
                 Ok(()) => format!("dumped {}", path.display()),
@@ -554,9 +782,7 @@ fn number_at<'a>(value: Option<&'a Value>, keys: &[&str]) -> Option<&'a Value> {
 }
 
 fn stats_text(c: &Chat) -> String {
-    let mut stats = vec![
-        format!("ID: {}", c.id),
-    ];
+    let mut stats = vec![format!("ID: {}", c.id())];
     if let Some(name) = c.name.as_ref() {
         stats.push(format!("Name: {name}"));
     }
@@ -565,19 +791,21 @@ fn stats_text(c: &Chat) -> String {
         stats.push(format!("Backend: {backend}"));
     }
     stats.extend([
-        format!("Finish: {}", c.finish.as_deref().unwrap_or("streaming")),
-        format!("Chunks: {}", c.chunks),
+        format!("Finish: {}", c.finish().unwrap_or("streaming")),
+        format!("Chunks: {}", c.chunks()),
         format!("Flow: {}", c.flow),
     ]);
+    if c.turns.len() > 1 {
+        stats.push(format!("Turns: {}", c.turns.len()));
+    }
     let tool_count = c
-        .tool_calls
-        .iter()
+        .tool_calls()
         .filter(|tc| !tc.id.is_empty() || !tc.name.is_empty() || !tc.arguments.is_empty())
         .count();
     if tool_count > 0 {
         stats.push(format!("Tool calls: {tool_count}"));
     }
-    if let Some(usage) = c.usage.as_ref() {
+    if let Some(usage) = c.usage() {
         let prompt = number_at(Some(usage), &["prompt_tokens"]);
         let completion = number_at(Some(usage), &["completion_tokens"]);
         let total = number_at(Some(usage), &["total_tokens"]);
@@ -590,7 +818,7 @@ fn stats_text(c: &Chat) -> String {
             ));
         }
     }
-    if let Some(timings) = c.timings.as_ref() {
+    if let Some(timings) = c.timings() {
         let predicted = number_at(
             Some(timings),
             &["predicted_per_second", "tokens_per_second"],
@@ -662,36 +890,89 @@ fn extract_objects(buffer: &mut String) -> Vec<Value> {
     };
     out
 }
+fn messages_text(messages: &[Value], skip: usize) -> String {
+    let mut out = String::new();
+    for m in messages.iter().skip(skip) {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("unknown");
+        let content = m
+            .get("content")
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| serde_json::to_string_pretty(v).unwrap_or_default())
+            })
+            .unwrap_or_default();
+        out.push_str(&format!("[{role}]\n{content}\n"));
+        if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                let name = call
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("function");
+                let args = call
+                    .pointer("/function/arguments")
+                    .and_then(Value::as_str)
+                    .map(compact_arguments)
+                    .unwrap_or_default();
+                out.push_str(&format!("  → {name}({args})\n"));
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
 fn request_text(request: Option<&Value>) -> String {
     let Some(r) = request else {
         return "(request began before capture)".into();
     };
-    let mut out = String::new();
     if let Some(messages) = r.get("messages").and_then(Value::as_array) {
-        for m in messages {
-            let role = m.get("role").and_then(Value::as_str).unwrap_or("unknown");
-            let content = m
-                .get("content")
-                .map(|v| {
-                    v.as_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| serde_json::to_string_pretty(v).unwrap_or_default())
-                })
-                .unwrap_or_default();
-            out.push_str(&format!("[{role}]\n{content}\n\n"));
-        }
+        messages_text(messages, 0)
     } else {
-        out = serde_json::to_string_pretty(r).unwrap_or_default()
+        serde_json::to_string_pretty(r).unwrap_or_default()
     }
-    out
 }
-fn tool_calls_text(c: &Chat) -> String {
+/// Only the messages a continuation turn added, so a long conversation is not
+/// printed again for every tool round trip.
+fn request_delta_text(previous: Option<&Value>, current: Option<&Value>) -> String {
+    let (Some(previous), Some(current)) = (previous, current) else {
+        return request_text(current);
+    };
+    let (Some(prev), Some(new)) = (
+        previous.get("messages").and_then(Value::as_array),
+        current.get("messages").and_then(Value::as_array),
+    ) else {
+        return request_text(Some(current));
+    };
+    let common = new
+        .iter()
+        .zip(prev)
+        .take_while(|(new, prev)| new == prev)
+        .count();
+    if common == 0 {
+        return request_text(Some(current));
+    }
+    messages_text(new, common)
+}
+fn turn_request_text(turns: &[Turn], index: usize) -> String {
+    let turn = &turns[index];
+    match index.checked_sub(1) {
+        Some(previous) => {
+            request_delta_text(turns[previous].request.as_ref(), turn.request.as_ref())
+        }
+        None => request_text(turn.request.as_ref()),
+    }
+}
+fn tool_calls_text(turn: &Turn) -> String {
     let mut out = String::new();
-    for tc in &c.tool_calls {
+    for tc in &turn.tool_calls {
         if tc.id.is_empty() && tc.name.is_empty() && tc.arguments.is_empty() {
             continue;
         }
-        let name: &str = if tc.name.is_empty() { "function" } else { &tc.name };
+        let name: &str = if tc.name.is_empty() {
+            "function"
+        } else {
+            &tc.name
+        };
         out.push_str(&format!("[{}] {name}\n", tc.id));
         let args = compact_arguments(&tc.arguments);
         if !args.is_empty() {
@@ -702,15 +983,24 @@ fn tool_calls_text(c: &Chat) -> String {
 }
 
 fn render_chat(c: &Chat) -> String {
-    let mut out = format!(
-        "{}\n\n=== REQUEST ===\n{}\n=== REASONING ===\n{}\n\n=== ANSWER ===\n{}\n",
-        stats_text(c),
-        request_text(c.request.as_ref()),
-        c.reasoning,
-        c.answer
-    );
-    if !c.tool_calls.is_empty() {
-        out.push_str(&format!("\n=== TOOL CALLS ===\n{}\n", tool_calls_text(c)));
+    let mut out = format!("{}\n\n", stats_text(c));
+    for (index, turn) in c.turns.iter().enumerate() {
+        if c.turns.len() > 1 {
+            out.push_str(&format!("=== TURN {} ===\n", index + 1));
+        }
+        out.push_str(&format!(
+            "=== REQUEST ===\n{}\n=== REASONING ===\n{}\n\n=== ANSWER ===\n{}\n",
+            turn_request_text(&c.turns, index),
+            turn.reasoning,
+            turn.answer
+        ));
+        if !turn.tool_calls.is_empty() {
+            out.push_str(&format!(
+                "\n=== TOOL CALLS ===\n{}\n",
+                tool_calls_text(turn)
+            ));
+        }
+        out.push('\n');
     }
     out
 }
@@ -729,12 +1019,83 @@ fn body_section(out: &mut Vec<Line<'static>>, header: &str, text: &str, style: S
 fn render_body(c: &Chat) -> Text<'static> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let default = Style::default();
-    body_section(&mut out, "=== REQUEST ===", &request_text(c.request.as_ref()), default);
-    body_section(&mut out, "=== REASONING ===", &c.reasoning, default);
-    body_section(&mut out, "=== ANSWER ===", &c.answer, default);
-    if !c.tool_calls.is_empty() {
-        let orange = Style::default().fg(Color::Rgb(255, 165, 0));
-        body_section(&mut out, "=== TOOL CALLS ===", &tool_calls_text(c), orange);
+    let orange = Style::default().fg(Color::Rgb(255, 165, 0));
+    for (index, turn) in c.turns.iter().enumerate() {
+        if c.turns.len() > 1 {
+            body_section(
+                &mut out,
+                &format!("=== TURN {} ===", index + 1),
+                "",
+                Style::default().fg(Color::Cyan),
+            );
+        }
+        body_section(
+            &mut out,
+            "=== REQUEST ===",
+            &turn_request_text(&c.turns, index),
+            default,
+        );
+        body_section(&mut out, "=== REASONING ===", &turn.reasoning, default);
+        body_section(&mut out, "=== ANSWER ===", &turn.answer, default);
+        if !turn.tool_calls.is_empty() {
+            body_section(
+                &mut out,
+                "=== TOOL CALLS ===",
+                &tool_calls_text(turn),
+                orange,
+            );
+        }
+    }
+    Text::from(out)
+}
+
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if d.as_millis() < 1000 {
+        format!("{}ms", d.as_millis())
+    } else if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// The left-hand column: one entry per generated run of thinking, answer or
+/// tool call, in generation order, with its estimated token count and actual
+/// wall-clock duration.
+fn timeline_body(c: &Chat) -> Text<'static> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let dim = Style::default().fg(Color::DarkGray);
+    let turns = c.turns.len();
+    for (index, turn) in c.turns.iter().enumerate() {
+        for segment in &turn.segments {
+            let active = segment.ended.is_none();
+            let marker = if active { "▶" } else { "•" };
+            let mut style = Style::default().fg(segment.kind.color());
+            if active {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            out.push(Line::from(Span::styled(
+                format!(
+                    "{marker} {:<8} {:>4}tok {}",
+                    segment.kind.label(),
+                    segment.tokens(),
+                    format_duration(segment.duration())
+                ),
+                style,
+            )));
+        }
+        if turns > 1 && index + 1 < turns {
+            out.push(Line::from(Span::styled(
+                format!("  ── turn {} ──", index + 2),
+                dim,
+            )));
+        }
+    }
+    if out.is_empty() {
+        out.push(Line::from(Span::styled("  (no output yet)", dim)));
     }
     Text::from(out)
 }
@@ -803,12 +1164,19 @@ fn first_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 fn last_chars(s: &str, n: usize) -> String {
-    s.chars().rev().take(n).collect::<Vec<_>>().into_iter().rev().collect()
+    s.chars()
+        .rev()
+        .take(n)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
 }
 fn name_prompt(c: &Chat) -> String {
     let first_user = c
-        .request
-        .as_ref()
+        .turns
+        .first()
+        .and_then(|t| t.request.as_ref())
         .and_then(|r| r.get("messages").and_then(Value::as_array))
         .and_then(|m| {
             m.iter()
@@ -818,7 +1186,7 @@ fn name_prompt(c: &Chat) -> String {
         })
         .map(|s| first_chars(&s, 100))
         .unwrap_or_default();
-    let tail = last_chars(&c.answer, 1000);
+    let tail = last_chars(&c.last().answer, 1000);
     format!(
         "Name this chat conversation in 2-6 words. Reply with ONLY the name, no quotes, no trailing punctuation.\n\nFirst user message (first 100 chars):\n{first_user}\n\nEnd of conversation (last 1000 chars):\n{tail}"
     )
@@ -851,17 +1219,7 @@ fn run_namer(model: &str, prompt: &str) -> Result<String, String> {
 fn spawn_ngrep(interface: &str) -> io::Result<(Child, Receiver<Packet>)> {
     let mut child = Command::new("pkexec")
         .arg("/usr/bin/ngrep")
-        .args([
-            "-q",
-            "-l",
-            "-u",
-            "-d",
-            interface,
-            "-W",
-            "byline",
-            "",
-            "tcp",
-        ])
+        .args(["-q", "-l", "-u", "-d", interface, "-W", "byline", "", "tcp"])
         .stdout(Stdio::piped())
         .spawn()?;
     let stdout = child.stdout.take().unwrap();
@@ -909,19 +1267,21 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             .chats
             .iter()
             .map(|c| {
-                let (marker, color) = match c.finish.as_deref() {
-                    None => ("●", Color::Green),
-                    Some("tool_calls") => ("✓", Color::DarkGray),
-                    Some(_) => ("✓", Color::White),
-                };
-                let label = c.name.clone().unwrap_or_else(|| c.id.clone());
+                // Tab color tracks the last generated thing: orange for a tool
+                // call, gray for thinking, white for an answer.
+                let marker = if c.finish().is_none() { "●" } else { "✓" };
+                let label = c.name.clone().unwrap_or_else(|| c.id().to_owned());
                 (
                     format!(" {} {} ", middle_elide(&label, 24), marker),
-                    Style::default().fg(color),
+                    Style::default().fg(c.state_color()),
                 )
             })
             .collect();
-        build_tab_line(&items, app.selected, areas[0].width.saturating_sub(2) as usize)
+        build_tab_line(
+            &items,
+            app.selected,
+            areas[0].width.saturating_sub(2) as usize,
+        )
     };
     frame.render_widget(
         Paragraph::new(tab_line).block(
@@ -931,7 +1291,17 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         ),
         areas[0],
     );
+    let timeline_width = (areas[1].width / 3).clamp(24, 36);
+    let content = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(timeline_width), Constraint::Min(1)])
+        .split(areas[1]);
     if let Some(c) = app.chats.get_mut(app.selected) {
+        frame.render_widget(
+            Paragraph::new(timeline_body(c))
+                .block(Block::default().borders(Borders::ALL).title(" timeline ")),
+            content[0],
+        );
         let stats = stats_text(c);
         let stats_height = stats
             .lines()
@@ -941,7 +1311,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         let details = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(stats_height), Constraint::Min(1)])
-            .split(areas[1]);
+            .split(content[1]);
         frame.render_widget(
             Paragraph::new(stats).block(Block::default().borders(Borders::ALL).title(" stats ")),
             details[0],
@@ -957,8 +1327,8 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 .block(Block::default().borders(Borders::ALL).title(format!(
                     " {} | {} chunks | {} ",
                     c.model,
-                    c.chunks,
-                    c.finish.as_deref().unwrap_or("streaming")
+                    c.chunks(),
+                    c.finish().unwrap_or("streaming")
                 )))
                 .wrap(Wrap { trim: false })
                 .scroll((c.scroll, 0)),
@@ -966,19 +1336,29 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         );
     } else {
         frame.render_widget(
+            Paragraph::new("(no chat)")
+                .block(Block::default().borders(Borders::ALL).title(" timeline ")),
+            content[0],
+        );
+        frame.render_widget(
             Paragraph::new("No conversations captured yet.")
                 .block(Block::default().borders(Borders::ALL)),
-            areas[1],
+            content[1],
         );
     }
     let bottom = match app.rename.as_ref() {
         Some(buf) => Line::from(vec![
             Span::styled(
                 " rename ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(" {buf} ")),
-            Span::styled("│ Enter=save  Esc=cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "│ Enter=save  Esc=cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
         ]),
         None => {
             let key = |k: &'static str| Span::styled(k, Style::default().fg(Color::Cyan));
@@ -1042,7 +1422,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let name = name.trim().to_string();
                     if name.is_empty() {
                         app.status = "ai-name: empty result".into();
-                    } else if let Some(c) = app.chats.iter_mut().find(|c| c.id == id) {
+                    } else if let Some(c) = app.chats.iter_mut().find(|c| c.id() == id) {
                         c.name = Some(name.clone());
                         app.status = format!("named → {name}");
                     } else {
@@ -1124,7 +1504,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     };
                     let prompt = name_prompt(c);
-                    let id = c.id.clone();
+                    let id = c.id().to_owned();
                     let model = env::var("SNIFF_NAMER").unwrap_or_else(|_| "gemma4:e2b".into());
                     let tx = name_tx.clone();
                     app.status = format!("ai-naming with {model}…");
@@ -1182,7 +1562,7 @@ mod tests {
 
         let chat = &app.chats[0];
         assert_eq!(chat.model, "qwen3.8");
-        assert_eq!(chat.chunks, 2);
+        assert_eq!(chat.chunks(), 2);
         assert!(stats_text(chat).contains("prompt 10 | completion 2 | total 12"));
     }
 
@@ -1199,8 +1579,16 @@ mod tests {
         );
 
         assert_eq!(app.chats.len(), 1, "same id must have only one tab");
-        assert_eq!(app.chats[0].answer, "hello", "mirrored chunk must be ignored");
-        assert_eq!(app.chats[0].chunks, 1, "mirrored chunk must not affect stats");
+        assert_eq!(
+            app.chats[0].last().answer,
+            "hello",
+            "mirrored chunk must be ignored"
+        );
+        assert_eq!(
+            app.chats[0].chunks(),
+            1,
+            "mirrored chunk must not affect stats"
+        );
     }
 
     #[test]
@@ -1236,7 +1624,10 @@ mod tests {
         let style = Style::default();
         let items: Vec<(String, Style)> = (0..6).map(|i| (format!(" tab{i} ● "), style)).collect();
         let text = build_tab_line(&items, 3, 30).to_string();
-        assert!(text.contains("tab3"), "selected tab must be visible: {text}");
+        assert!(
+            text.contains("tab3"),
+            "selected tab must be visible: {text}"
+        );
         assert!(text.contains("+"), "overflow indicator expected: {text}");
     }
 
@@ -1275,8 +1666,14 @@ mod tests {
     #[test]
     fn new_chats_do_not_steal_selection() {
         let mut app = App::new();
-        app.response("f", json!({"id": "c1", "choices": [{"delta": {"content": "a"}}]}));
-        app.response("f", json!({"id": "c2", "choices": [{"delta": {"content": "b"}}]}));
+        app.response(
+            "f",
+            json!({"id": "c1", "choices": [{"delta": {"content": "a"}}]}),
+        );
+        app.response(
+            "f",
+            json!({"id": "c2", "choices": [{"delta": {"content": "b"}}]}),
+        );
         assert_eq!(app.selected, 0, "selection should stay on the first chat");
         assert_eq!(app.chats.len(), 2);
     }
@@ -1304,10 +1701,15 @@ mod tests {
             }),
         );
         let chat = &app.chats[0];
-        assert_eq!(chat.tool_calls.len(), 1, "must be one call, not one line per fragment");
-        assert_eq!(chat.tool_calls[0].id, "call_1");
-        assert_eq!(chat.tool_calls[0].name, "get_weather");
-        assert_eq!(chat.tool_calls[0].arguments, "{\"city\":\"Paris\"}");
+        let calls: Vec<_> = chat.tool_calls().collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "must be one call, not one line per fragment"
+        );
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].arguments, "{\"city\":\"Paris\"}");
         assert!(stats_text(chat).contains("Tool calls: 1"));
     }
 
@@ -1326,12 +1728,18 @@ mod tests {
             }),
         );
         let chat = &app.chats[0];
-        let text = tool_calls_text(chat);
+        let text = tool_calls_text(chat.last());
         let lines: Vec<&str> = text.lines().collect();
         // Pretty-printed arguments must collapse to a single compact line.
-        let open_braces = lines.iter().filter(|l| l.trim_start().starts_with('{')).count();
+        let open_braces = lines
+            .iter()
+            .filter(|l| l.trim_start().starts_with('{'))
+            .count();
         assert_eq!(open_braces, 1, "args should be one line: {lines:?}");
-        assert!(!lines.iter().any(|l| l.trim() == "}"), "no orphaned brace: {lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.trim() == "}"),
+            "no orphaned brace: {lines:?}"
+        );
         assert!(text.contains("\"path\""));
         assert!(text.contains("/tmp/agent-home"));
     }
@@ -1339,7 +1747,10 @@ mod tests {
     #[test]
     fn rename_commit_sets_and_clears_name() {
         let mut app = App::new();
-        app.response("f", json!({"id": "c1", "choices": [{"delta": {"content": "a"}}]}));
+        app.response(
+            "f",
+            json!({"id": "c1", "choices": [{"delta": {"content": "a"}}]}),
+        );
         app.rename = Some("my chat".into());
         app.rename_commit();
         assert_eq!(app.chats[0].name.as_deref(), Some("my chat"));
@@ -1357,8 +1768,14 @@ mod tests {
 
     #[test]
     fn classify_directions_by_http_and_json_shape() {
-        assert_eq!(classify("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream"), Some(Dir::Response));
-        assert_eq!(classify("POST /v1/chat/completions HTTP/1.1"), Some(Dir::Request));
+        assert_eq!(
+            classify("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream"),
+            Some(Dir::Response)
+        );
+        assert_eq!(
+            classify("POST /v1/chat/completions HTTP/1.1"),
+            Some(Dir::Request)
+        );
         assert_eq!(
             classify("data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}"),
             Some(Dir::Response)
@@ -1373,10 +1790,18 @@ mod tests {
 
     #[test]
     fn llm_response_requires_id_and_body() {
-        assert!(is_llm_response(&json!({"id":"c1","choices":[{"delta":{}}]})));
+        assert!(is_llm_response(
+            &json!({"id":"c1","choices":[{"delta":{}}]})
+        ));
         assert!(is_llm_response(&json!({"id":"c1","choices":[],"usage":{}})));
-        assert!(!is_llm_response(&json!({"choices":[{"delta":{}}]})), "missing id");
-        assert!(!is_llm_response(&json!({"id":"c1","messages":[]})), "missing body");
+        assert!(
+            !is_llm_response(&json!({"choices":[{"delta":{}}]})),
+            "missing id"
+        );
+        assert!(
+            !is_llm_response(&json!({"id":"c1","messages":[]})),
+            "missing body"
+        );
     }
 
     #[test]
@@ -1393,7 +1818,8 @@ mod tests {
         // Request from client 5555 to server 8080 (no fixed port configured).
         app.packet(Packet {
             header: "T 192.168.1.50:5555 -> 192.168.1.50:8080".into(),
-            payload: "{\"model\":\"qwen\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}".into(),
+            payload: "{\"model\":\"qwen\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+                .into(),
         });
         // Response back from the same server endpoint.
         app.packet(Packet {
@@ -1401,9 +1827,196 @@ mod tests {
             payload: "{\"id\":\"c1\",\"model\":\"qwen\",\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}".into(),
         });
         assert_eq!(app.chats.len(), 1, "one chat expected");
-        assert_eq!(app.chats[0].id, "c1");
+        assert_eq!(app.chats[0].id(), "c1");
         assert_eq!(app.chats[0].model, "qwen");
         // The non-LLM flow must not have been created.
-        assert!(!app.flows.keys().any(|k| !k.contains("8080")), "no stray flows");
+        assert!(
+            !app.flows.keys().any(|k| !k.contains("8080")),
+            "no stray flows"
+        );
+    }
+
+    fn first_request() -> Value {
+        json!({
+            "model": "qwen",
+            "messages": [{"role": "user", "content": "find the file"}]
+        })
+    }
+    fn continuation_request() -> Value {
+        json!({
+            "model": "qwen",
+            "messages": [
+                {"role": "user", "content": "find the file"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "search", "arguments": "{\"q\":\"file\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "found /tmp/file"}
+            ]
+        })
+    }
+
+    #[test]
+    fn continuation_after_tool_call_extends_the_same_chat() {
+        let mut app = App::new();
+        app.packet(Packet {
+            header: "T 127.0.0.1:5000 -> 127.0.0.1:8080".into(),
+            payload: first_request().to_string(),
+        });
+        app.packet(Packet {
+            header: "T 127.0.0.1:8080 -> 127.0.0.1:5000".into(),
+            payload: json!({
+                "id": "c1",
+                "choices": [{"delta": {"tool_calls": [
+                    {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{\"q\":\"file\"}"}}
+                ]}, "finish_reason": "tool_calls"}]
+            })
+            .to_string(),
+        });
+        // The client comes back on a fresh connection with the tool result.
+        app.packet(Packet {
+            header: "T 127.0.0.1:5001 -> 127.0.0.1:8080".into(),
+            payload: continuation_request().to_string(),
+        });
+        app.packet(Packet {
+            header: "T 127.0.0.1:8080 -> 127.0.0.1:5001".into(),
+            payload: json!({
+                "id": "c2",
+                "choices": [{"delta": {"content": "the file is /tmp/file"}, "finish_reason": "stop"}]
+            })
+            .to_string(),
+        });
+
+        assert_eq!(app.chats.len(), 1, "continuation must reuse the tab");
+        let chat = &app.chats[0];
+        assert_eq!(chat.id(), "c1", "the tab keeps the first session id");
+        assert_eq!(chat.turns.len(), 2);
+        assert_eq!(chat.turns[1].id, "c2");
+        assert_eq!(chat.last().answer, "the file is /tmp/file");
+        let dump = render_chat(chat);
+        assert!(dump.contains("=== TURN 2 ==="));
+        assert!(
+            dump.contains("found /tmp/file"),
+            "only the new messages are rendered"
+        );
+        assert_eq!(
+            dump.matches("find the file").count(),
+            1,
+            "history is not repeated"
+        );
+    }
+
+    #[test]
+    fn continuation_search_skips_chats_without_a_captured_request() {
+        let mut app = App::new();
+        // A chat captured mid-stream has no request to compare against.
+        app.response(
+            "f",
+            json!({"id": "c0", "choices": [{"delta": {"content": "hi"}}]}),
+        );
+        // A second, fully captured chat must still be found after skipping it.
+        app.packet(Packet {
+            header: "T 127.0.0.1:5000 -> 127.0.0.1:8080".into(),
+            payload: first_request().to_string(),
+        });
+        app.response(
+            "127.0.0.1:5000 <-> 127.0.0.1:8080",
+            json!({"id": "c1", "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{}"}}
+            ]}, "finish_reason": "tool_calls"}]}),
+        );
+        app.packet(Packet {
+            header: "T 127.0.0.1:5001 -> 127.0.0.1:8080".into(),
+            payload: continuation_request().to_string(),
+        });
+        app.response(
+            "127.0.0.1:5001 <-> 127.0.0.1:8080",
+            json!({"id": "c2", "choices": [{"delta": {"content": "done"}}]}),
+        );
+
+        assert_eq!(app.chats.len(), 2, "no extra tab");
+        assert_eq!(
+            app.chats[1].turns.len(),
+            2,
+            "the captured chat must continue"
+        );
+    }
+
+    #[test]
+    fn a_request_without_tool_output_starts_a_new_chat() {
+        let mut app = App::new();
+        app.packet(Packet {
+            header: "T 127.0.0.1:5000 -> 127.0.0.1:8080".into(),
+            payload: first_request().to_string(),
+        });
+        app.response(
+            "a",
+            json!({"id": "c1", "choices": [{"delta": {"content": "hi"}}]}),
+        );
+        // Same first message but nothing added: a different conversation, not a continuation.
+        app.packet(Packet {
+            header: "T 127.0.0.1:5002 -> 127.0.0.1:8080".into(),
+            payload: json!({
+                "model": "qwen",
+                "messages": [
+                    {"role": "user", "content": "find the file"},
+                    {"role": "user", "content": "another question"}
+                ]
+            })
+            .to_string(),
+        });
+        app.response(
+            "b",
+            json!({"id": "c2", "choices": [{"delta": {"content": "yo"}}]}),
+        );
+        assert_eq!(app.chats.len(), 2);
+    }
+
+    #[test]
+    fn timeline_tracks_thinking_answer_and_tool_segments() {
+        let mut app = App::new();
+        app.response(
+            "f",
+            json!({"id": "c1", "choices": [{"delta": {"reasoning_content": "pondering"}}]}),
+        );
+        assert_eq!(app.chats[0].last().segments.len(), 1);
+        assert_eq!(app.chats[0].state_color(), Color::DarkGray);
+        app.response(
+            "f",
+            json!({"id": "c1", "choices": [{"delta": {"content": "answer"}}]}),
+        );
+        app.response(
+            "f",
+            json!({"id": "c1", "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{\"q\":\"x\"}"}}
+            ]}, "finish_reason": "tool_calls"}]}),
+        );
+
+        let chat = &app.chats[0];
+        let segments = &chat.last().segments;
+        assert_eq!(
+            segments.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            vec![SegKind::Thinking, SegKind::Answer, SegKind::Tool]
+        );
+        assert!(
+            segments.iter().all(|s| s.ended.is_some()),
+            "finish must close the active segment"
+        );
+        assert_eq!(
+            chat.state_color(),
+            Color::Rgb(255, 165, 0),
+            "last output was a tool call"
+        );
+        let timeline = timeline_body(chat).to_string();
+        assert!(timeline.contains("thinking"), "{timeline}");
+        assert!(timeline.contains("answer"), "{timeline}");
+        assert!(timeline.contains("tool"), "{timeline}");
+    }
+
+    #[test]
+    fn formats_durations_compactly() {
+        assert_eq!(format_duration(Duration::from_millis(350)), "350ms");
+        assert_eq!(format_duration(Duration::from_secs(12)), "12s");
+        assert_eq!(format_duration(Duration::from_secs(125)), "2m05s");
     }
 }

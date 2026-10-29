@@ -1502,25 +1502,37 @@ fn tool_calls_text(turn: &Turn) -> String {
     out.trim_end().to_string()
 }
 
+/// The sections of one turn, in display order. The single source of the dump
+/// and body layout: render_chat, render_body and the anchor math in
+/// segment_anchor_rows all consume this, so the layout can only change here.
+fn turn_sections(c: &Chat, index: usize) -> Vec<(String, String)> {
+    let turn = &c.turns[index];
+    let mut sections = Vec::new();
+    if c.turns.len() > 1 {
+        sections.push((format!("=== TURN {} ===", index + 1), String::new()));
+    }
+    sections.push(("=== REQUEST ===".into(), turn_request_text(&c.turns, index)));
+    sections.push(("=== REASONING ===".into(), turn.reasoning.clone()));
+    sections.push(("=== ANSWER ===".into(), turn.answer.clone()));
+    if !turn.tool_calls.is_empty() {
+        sections.push(("=== TOOL CALLS ===".into(), tool_calls_text(turn)));
+    }
+    sections
+}
+
 fn render_chat(c: &Chat) -> String {
     let mut out = format!("{}\n\n", stats_text(c));
-    for (index, turn) in c.turns.iter().enumerate() {
-        if c.turns.len() > 1 {
-            out.push_str(&format!("=== TURN {} ===\n", index + 1));
+    for index in 0..c.turns.len() {
+        for (header, text) in turn_sections(c, index) {
+            // Same line layout as body_section: header, text lines, blank.
+            out.push_str(&header);
+            out.push('\n');
+            for line in text.lines() {
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push('\n');
         }
-        out.push_str(&format!(
-            "=== REQUEST ===\n{}\n=== REASONING ===\n{}\n\n=== ANSWER ===\n{}\n",
-            turn_request_text(&c.turns, index),
-            turn.reasoning,
-            turn.answer
-        ));
-        if !turn.tool_calls.is_empty() {
-            out.push_str(&format!(
-                "\n=== TOOL CALLS ===\n{}\n",
-                tool_calls_text(turn)
-            ));
-        }
-        out.push('\n');
     }
     out
 }
@@ -1540,30 +1552,15 @@ fn render_body(c: &Chat) -> Text<'static> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let default = Style::default();
     let orange = Style::default().fg(TOOL_ORANGE);
-    for (index, turn) in c.turns.iter().enumerate() {
-        if c.turns.len() > 1 {
-            body_section(
-                &mut out,
-                &format!("=== TURN {} ===", index + 1),
-                "",
-                Style::default().fg(Color::Cyan),
-            );
-        }
-        body_section(
-            &mut out,
-            "=== REQUEST ===",
-            &turn_request_text(&c.turns, index),
-            default,
-        );
-        body_section(&mut out, "=== REASONING ===", &turn.reasoning, default);
-        body_section(&mut out, "=== ANSWER ===", &turn.answer, default);
-        if !turn.tool_calls.is_empty() {
-            body_section(
-                &mut out,
-                "=== TOOL CALLS ===",
-                &tool_calls_text(turn),
-                orange,
-            );
+    let cyan = Style::default().fg(Color::Cyan);
+    for index in 0..c.turns.len() {
+        for (header, text) in turn_sections(c, index) {
+            let style = match header.as_str() {
+                "=== TOOL CALLS ===" => orange,
+                h if h.starts_with("=== TURN ") => cyan,
+                _ => default,
+            };
+            body_section(&mut out, &header, &text, style);
         }
     }
     Text::from(out)
@@ -1668,11 +1665,10 @@ fn tool_call_line_starts(turn: &Turn) -> Vec<usize> {
 /// built by `render_body`. Clicking a timeline row jumps the body scroll to
 /// that row; the row that starts the visible area underlines its entry.
 // Why the fallback arithmetic: this maps logical body lines to wrapped
-// display rows and must mirror — line for line — the section layout that
-// render_chat/render_body emit, or timeline anchors drift out of sync with
-// the visible text. `unwrap_or(row)` tolerates lines appended after the map
-// was built; `unwrap_or(0)`-style fallbacks keep out-of-range segments
-// anchored at the top instead of panicking.
+// display rows. It walks the same turn_sections list the renderers emit, so
+// anchors stay in sync with the visible text by construction; the fallbacks
+// (`unwrap_or(row)`, `unwrap_or(0)`) tolerate lines appended after the map
+// was built and out-of-range segments instead of panicking.
 fn segment_anchor_rows(c: &Chat, body: &Text<'static>, width: u16) -> Vec<usize> {
     let width = width.max(1) as usize;
     // Display row at which each logical line of the body starts. A logical
@@ -1684,24 +1680,24 @@ fn segment_anchor_rows(c: &Chat, body: &Text<'static>, width: u16) -> Vec<usize>
         row += line.width().div_ceil(width).max(1);
     }
     let mut out: Vec<usize> = Vec::new();
-    let mut line_idx = 0usize;
     for (index, turn) in c.turns.iter().enumerate() {
-        if c.turns.len() > 1 {
-            line_idx += 2; // "=== TURN n ===" header line + blank line
+        // Walk the shared section list exactly as the renderers emit it:
+        // each section costs header + text lines + blank, and its text
+        // starts one line after its header.
+        let mut line_idx = 0usize;
+        let mut reasoning_start = 0usize;
+        let mut answer_start = 0usize;
+        let mut tool_start = None;
+        for (header, text) in turn_sections(c, index) {
+            let text_start = line_idx + 1;
+            match header.as_str() {
+                "=== REASONING ===" => reasoning_start = text_start,
+                "=== ANSWER ===" => answer_start = text_start,
+                "=== TOOL CALLS ===" => tool_start = Some(text_start),
+                _ => {}
+            }
+            line_idx += 2 + text.lines().count();
         }
-        let request = turn_request_text(&c.turns, index);
-        line_idx += 2 + request.lines().count(); // header + text + blank
-        let reasoning_start = line_idx + 1;
-        line_idx += 2 + turn.reasoning.lines().count();
-        let answer_start = line_idx + 1;
-        line_idx += 2 + turn.answer.lines().count();
-        let tool_start = if turn.tool_calls.is_empty() {
-            None
-        } else {
-            let start = line_idx + 1;
-            line_idx += 2 + tool_calls_text(turn).lines().count();
-            Some(start)
-        };
         // Each kind's accumulated text is the concatenation of that kind's
         // segments in generation order, so a segment's first line sits
         // `newlines_before` past its section's first text line.
@@ -3346,5 +3342,45 @@ mod tests {
         assert_eq!(format_duration(Duration::from_millis(350)), "350ms");
         assert_eq!(format_duration(Duration::from_secs(12)), "12s");
         assert_eq!(format_duration(Duration::from_secs(125)), "2m05s");
+    }
+
+    #[test]
+    fn dump_and_body_share_one_layout() {
+        let mut app = App::new();
+        app.packet(request_body(5000, first_request()));
+        app.packet(response_packet(
+            5000,
+            delta_response(
+                "c1",
+                json!({"content": "calling search"}),
+                Some("tool_calls"),
+            ),
+        ));
+        app.packet(request_body(5001, continuation_request()));
+        app.packet(response_packet(
+            5001,
+            delta_response("c2", json!({"content": "done"}), Some("stop")),
+        ));
+        assert_eq!(app.chats.len(), 1);
+        let chat = &app.chats[0];
+        let dump = render_chat(chat);
+        let body = render_body(chat);
+        let dump_sections = &dump[dump.find("=== ").unwrap()..];
+        let body_lines: Vec<String> = body
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+        assert_eq!(
+            dump_sections.lines().collect::<Vec<_>>(),
+            body_lines,
+            "the dump and the body panel must render the same layout"
+        );
     }
 }

@@ -184,6 +184,79 @@ impl Turn {
             last.ended.get_or_insert_with(Instant::now);
         }
     }
+
+    /// Apply one streamed response chunk to this turn. Returns false when the
+    /// chunk carries no `choices[0]` — usage/timings still count, nothing else
+    /// does. (Mirrors the early return the caller used to make inline.)
+    fn apply_chunk(&mut self, value: &Value) -> bool {
+        if let Some(usage) = value.get("usage") {
+            self.usage = Some(usage.clone());
+        }
+        if let Some(timings) = value.get("timings") {
+            self.timings = Some(timings.clone());
+        }
+        self.chunks += 1;
+        let Some(choice) = value.pointer("/choices/0") else {
+            return false;
+        };
+        let delta = choice.get("delta").or_else(|| choice.get("message"));
+        if let Some(s) = delta.and_then(|v| str_field(v, "reasoning_content")) {
+            self.reasoning.push_str(s);
+            self.push(SegKind::Thinking, s);
+        }
+        if let Some(s) = delta.and_then(|v| str_field(v, "content")) {
+            self.answer.push_str(s);
+            self.push(SegKind::Answer, s);
+        }
+        if let Some(calls) = delta
+            .and_then(|v| v.get("tool_calls"))
+            .and_then(Value::as_array)
+        {
+            for (pos, call) in calls.iter().enumerate() {
+                // Tool-call arguments stream as many small deltas; concatenate them
+                // per call (keyed by the delta `index`) instead of one line each.
+                let idx = call
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .map(|i| i as usize)
+                    .unwrap_or(pos);
+                while self.tool_calls.len() <= idx {
+                    self.tool_calls.push(ToolCall::default());
+                }
+                let mut label = String::new();
+                {
+                    let tc = &mut self.tool_calls[idx];
+                    if tc.id.is_empty() {
+                        tc.id = str_field(call, "id").map(str::to_owned).unwrap_or_default();
+                    }
+                    if tc.name.is_empty() {
+                        tc.name = call
+                            .pointer("/function/name")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            .unwrap_or_default();
+                        label.push_str(&tc.name);
+                    }
+                }
+                if let Some(args) = call.pointer("/function/arguments") {
+                    let frag = text_of(args, false);
+                    if !frag.is_empty() && !label.is_empty() {
+                        label.push(' ');
+                    }
+                    label.push_str(&frag);
+                    self.tool_calls[idx].arguments.push_str(&frag);
+                }
+                // Count the tool name too, so a call with empty arguments
+                // still produces a tool segment (and turns the tab orange).
+                self.push_tool(idx, &label);
+            }
+        }
+        if let Some(s) = str_field(choice, "finish_reason") {
+            self.finish = Some(s.into());
+            self.close_active();
+        }
+        true
+    }
 }
 
 struct Chat {
@@ -550,73 +623,8 @@ impl App {
         }
         {
             let turn = chat.turns.last_mut().expect("chat has a turn");
-            if let Some(usage) = value.get("usage") {
-                turn.usage = Some(usage.clone());
-            }
-            if let Some(timings) = value.get("timings") {
-                turn.timings = Some(timings.clone());
-            }
-            turn.chunks += 1;
-            let Some(choice) = value.pointer("/choices/0") else {
+            if !turn.apply_chunk(&value) {
                 return;
-            };
-            let delta = choice.get("delta").or_else(|| choice.get("message"));
-            if let Some(s) = delta.and_then(|v| str_field(v, "reasoning_content")) {
-                turn.reasoning.push_str(s);
-                turn.push(SegKind::Thinking, s);
-            }
-            if let Some(s) = delta.and_then(|v| str_field(v, "content")) {
-                turn.answer.push_str(s);
-                turn.push(SegKind::Answer, s);
-            }
-            if let Some(calls) = delta
-                .and_then(|v| v.get("tool_calls"))
-                .and_then(Value::as_array)
-            {
-                for (pos, call) in calls.iter().enumerate() {
-                    // Tool-call arguments stream as many small deltas; concatenate them
-                    // per call (keyed by the delta `index`) instead of one line each.
-                    let idx = call
-                        .get("index")
-                        .and_then(Value::as_u64)
-                        .map(|i| i as usize)
-                        .unwrap_or(pos);
-                    while turn.tool_calls.len() <= idx {
-                        turn.tool_calls.push(ToolCall::default());
-                    }
-                    let mut label = String::new();
-                    {
-                        let tc = &mut turn.tool_calls[idx];
-                        if tc.id.is_empty() {
-                            tc.id = str_field(call, "id")
-                                .map(str::to_owned)
-                                .unwrap_or_default();
-                        }
-                        if tc.name.is_empty() {
-                            tc.name = call
-                                .pointer("/function/name")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned)
-                                .unwrap_or_default();
-                            label.push_str(&tc.name);
-                        }
-                    }
-                    if let Some(args) = call.pointer("/function/arguments") {
-                        let frag = text_of(args, false);
-                        if !frag.is_empty() && !label.is_empty() {
-                            label.push(' ');
-                        }
-                        label.push_str(&frag);
-                        turn.tool_calls[idx].arguments.push_str(&frag);
-                    }
-                    // Count the tool name too, so a call with empty arguments
-                    // still produces a tool segment (and turns the tab orange).
-                    turn.push_tool(idx, &label);
-                }
-            }
-            if let Some(s) = str_field(choice, "finish_reason") {
-                turn.finish = Some(s.into());
-                turn.close_active();
             }
         }
         let auto = {

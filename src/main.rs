@@ -402,6 +402,10 @@ enum Dir {
 }
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const TOOL_ORANGE: Color = Color::Rgb(255, 165, 0);
+/// Weight of a brief echo in the subagent-parent score. A brief match is a
+/// much stronger signal than the profile prompt or the timing-only fallback,
+/// so it dominates: any brief match outranks any combination without one.
+const BRIEF_MATCH_WEIGHT: usize = 10;
 struct App {
     flows: HashMap<String, Flow>,
     chats: Vec<Chat>,
@@ -786,7 +790,7 @@ impl App {
             if request.is_some() && !profile && !brief_match {
                 continue;
             }
-            let score = usize::from(brief_match) * 10
+            let score = usize::from(brief_match) * BRIEF_MATCH_WEIGHT
                 + usize::from(profile)
                 + usize::from(request.is_none());
             if best.is_none_or(|(best_score, _)| score >= best_score) {

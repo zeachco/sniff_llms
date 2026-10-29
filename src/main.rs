@@ -1359,6 +1359,11 @@ fn stats_text(c: &Chat) -> String {
     stats.join("\n")
 }
 
+// Why hand-rolled: streamed SSE chunks split JSON objects across packet
+// boundaries, so serde_json's StreamDeserializer cannot be used incrementally
+// here — objects are only complete once brace depth returns to zero inside
+// this growing buffer. The 4096-char tail cap keeps a long non-JSON prefix
+// from growing the buffer without bound.
 fn extract_objects(buffer: &mut String) -> Vec<Value> {
     let mut out = vec![];
     let mut start = None;
@@ -1662,6 +1667,12 @@ fn tool_call_line_starts(turn: &Turn) -> Vec<usize> {
 /// row — after wrapping at `width` — at which its text starts in the body
 /// built by `render_body`. Clicking a timeline row jumps the body scroll to
 /// that row; the row that starts the visible area underlines its entry.
+// Why the fallback arithmetic: this maps logical body lines to wrapped
+// display rows and must mirror — line for line — the section layout that
+// render_chat/render_body emit, or timeline anchors drift out of sync with
+// the visible text. `unwrap_or(row)` tolerates lines appended after the map
+// was built; `unwrap_or(0)`-style fallbacks keep out-of-range segments
+// anchored at the top instead of panicking.
 fn segment_anchor_rows(c: &Chat, body: &Text<'static>, width: u16) -> Vec<usize> {
     let width = width.max(1) as usize;
     // Display row at which each logical line of the body starts. A logical

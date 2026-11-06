@@ -65,8 +65,9 @@ from the mirrored client leg (including the declared thread id) is adopted
 without appending the stream twice.
 
 Keys: `Left/Right` switch chats, `Up/Down` scroll, `End` resumes following,
-`x` closes and forgets a chat, `m` merges the selected chat into the previous
-one as a continuation, `g` marks the selected tab as a group parent (press it
+`x` closes and forgets a chat, `X` closes every finished chat at once, `m`
+merges the selected chat into the previous one as a continuation, `g` marks the
+selected tab as a group parent (press it
 again on the child to attach it), `u` ungroups it, `d` writes
 `~/chat-id-{id}.log`, `a` cycles the auto-clean rule, `r` renames the current
 chat (`Enter` saves, `Esc` cancels, blank clears), `R` asks a local model for a
@@ -94,6 +95,17 @@ bar, and the status line records their captured ID.
 Auto-clean (key `a`) closes a chat as soon as it finishes with a matching
 reason. It cycles: off → tool_calls → stop → length → content_filter → off. The
 current rule is always shown in the bottom bar.
+
+`X` cleans the tab bar in one press: it closes every chat that has finished and
+keeps the running ones. A chat counts as running while its last turn is still
+streaming (no `finish_reason` yet), while it ended with `tool_calls` (the client
+is executing them, or a subagent is), or while its last chunk arrived less than
+30 seconds ago — the silent gap between two turns of a session you are still
+using, when nothing is on the wire. Each drop does exactly what `x` does for one
+chat: the response ids are forgotten so late chunks cannot resurrect the tab,
+the capture buffers of a connection nothing else uses are released, and a
+subagent tab whose parent was cleaned becomes a root tab instead of disappearing
+with it.
 
 The `R` key sends the first 100 characters of the user's request and the last
 1000 characters of the assistant output to `ollama run` (model `gemma4:e2b`,

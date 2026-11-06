@@ -28,6 +28,10 @@ use std::{
 };
 
 const MAX_FLOWS: usize = 2000;
+/// How long a chat that already finished may stay open after its last chunk:
+/// the silent gap between two turns of an interactive session, when nothing is
+/// on the wire yet but the harness is still in use.
+const LIVE_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 struct Flow {
@@ -320,6 +324,17 @@ impl Chat {
     }
     fn finish(&self) -> Option<&str> {
         self.last().finish.as_deref()
+    }
+    /// True while the conversation is still going: the last turn is generating,
+    /// or ended asking for tool calls (the client is executing them, or a
+    /// subagent is), or produced output inside the live-grace window.
+    fn is_running(&self) -> bool {
+        match self.finish() {
+            // No finish reason: still streaming, or the finish chunk was lost.
+            None => true,
+            Some("tool_calls") => true,
+            Some(_) => self.last_activity.elapsed() < LIVE_GRACE,
+        }
     }
     fn chunks(&self) -> usize {
         self.turns.iter().map(|t| t.chunks).sum()
@@ -949,7 +964,10 @@ impl App {
         for turn in &chat.turns {
             self.ignored.insert(turn.id.clone());
         }
-        if let Some(flow) = self.flows.get_mut(&chat.flow) {
+        // Release the capture buffers only when no other chat still lives on
+        // that connection, otherwise a chat we keep would lose its pending data.
+        let shared = self.chats.iter().any(|c| c.flow == chat.flow);
+        if !shared && let Some(flow) = self.flows.get_mut(&chat.flow) {
             flow.requests.clear();
             flow.request_buf.clear();
             flow.response_buf.clear();
@@ -969,6 +987,33 @@ impl App {
             self.selected = self.selected.min(self.chats.len() - 1);
         }
         self.status = format!("closed and forgot {closed_id}");
+    }
+    /// Close every finished chat and keep the running ones. Each drop goes
+    /// through `close_at`, so a cleaned chat is still forgotten by id, its flow
+    /// buffers are released, and its subagent tabs are reparented instead of
+    /// vanishing with it. Reverse order keeps the collected indices valid.
+    fn clean_done(&mut self) {
+        let done: Vec<usize> = self
+            .chats
+            .iter()
+            .enumerate()
+            .filter(|(_, chat)| !chat.is_running())
+            .map(|(index, _)| index)
+            .rev()
+            .collect();
+        if done.is_empty() {
+            self.status = "nothing finished to clean".into();
+            return;
+        }
+        let cleaned = done.len();
+        for index in done {
+            self.close_at(index);
+        }
+        self.status = format!(
+            "cleaned {cleaned} finished chat{} · {} running",
+            if cleaned == 1 { "" } else { "s" },
+            self.chats.len()
+        );
     }
     fn dump(&mut self) {
         let Some(chat) = self.chats.get(self.selected) else {
@@ -2084,6 +2129,8 @@ fn status_bar(app: &App) -> Line<'static> {
                 Span::raw(" scroll "),
                 key("x"),
                 Span::raw(" close "),
+                key("X"),
+                Span::raw(" clean done "),
                 key("m"),
                 Span::raw(" merge "),
                 key("g"),
@@ -2220,6 +2267,7 @@ fn handle_event(
                     c.follow = true
                 }
                 KeyCode::Char('x') => app.close(),
+                KeyCode::Char('X') => app.clean_done(),
                 KeyCode::Char('m') => app.merge_prev(),
                 KeyCode::Char('g') => app.group(),
                 KeyCode::Char('u') => app.ungroup(),
@@ -2455,6 +2503,112 @@ mod tests {
             delta_response("c1", json!({}), Some("tool_calls")),
         );
         assert_eq!(app.chats.len(), 1);
+    }
+
+    /// Push a chat's last chunk out of the live-grace window, so it reads as a
+    /// conversation nobody touched for a while.
+    fn make_idle(app: &mut App, id: &str) {
+        let chat = app
+            .chats
+            .iter_mut()
+            .find(|chat| chat.id() == id)
+            .expect("chat to age");
+        chat.last_activity = Instant::now() - Duration::from_secs(120);
+    }
+
+    #[test]
+    fn clean_done_keeps_only_running_chats() {
+        let mut app = App::new();
+        app.response(
+            "f1",
+            delta_response("streaming", json!({"content": "hi"}), None),
+        );
+        app.response(
+            "f2",
+            delta_response(
+                "awaiting_tools",
+                json!({"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "bash"}}]}),
+                Some("tool_calls"),
+            ),
+        );
+        app.response(
+            "f3",
+            delta_response("finished", json!({"content": "bye"}), Some("stop")),
+        );
+        make_idle(&mut app, "finished");
+
+        app.clean_done();
+
+        let ids: Vec<&str> = app.chats.iter().map(|chat| chat.id()).collect();
+        assert_eq!(
+            ids,
+            ["streaming", "awaiting_tools"],
+            "streaming and tool-waiting chats stay, finished ones go"
+        );
+        assert!(app.ignored.contains("finished"), "cleaned id is forgotten");
+        assert!(app.status.contains("cleaned 1 finished"), "{}", app.status);
+    }
+
+    #[test]
+    fn clean_done_keeps_a_session_that_stopped_moments_ago() {
+        let mut app = App::new();
+        app.response(
+            "f",
+            delta_response("c1", json!({"content": "bye"}), Some("stop")),
+        );
+
+        app.clean_done();
+
+        assert_eq!(
+            app.chats.len(),
+            1,
+            "a chat inside the grace window is still a live session"
+        );
+        assert!(app.status.contains("nothing finished"), "{}", app.status);
+    }
+
+    #[test]
+    fn clean_done_reparents_the_children_of_a_cleaned_parent() {
+        let mut app = App::new();
+        app.response(
+            "f",
+            subagent_parent_response("p1", "review the Caverace constructor wiring"),
+        );
+        app.response(
+            "g",
+            delta_response("s1", json!({"content": "reviewing"}), None),
+        );
+        // The parent collects the child's result and closes its own conversation.
+        app.response(
+            "f",
+            delta_response("p2", json!({"content": "done"}), Some("stop")),
+        );
+        make_idle(&mut app, "p1");
+        assert_eq!(app.chats[1].parent.as_deref(), Some("p1"));
+
+        app.clean_done();
+
+        assert_eq!(app.chats.len(), 1, "the running child survives");
+        assert_eq!(app.chats[0].id(), "s1");
+        assert!(app.chats[0].parent.is_none(), "orphans become roots");
+    }
+
+    #[test]
+    fn clean_done_clamps_the_selection() {
+        let mut app = App::new();
+        for i in 0..3 {
+            app.response(
+                "f",
+                delta_response(&format!("c{i}"), json!({"content": "x"}), Some("stop")),
+            );
+            make_idle(&mut app, &format!("c{i}"));
+        }
+        app.selected = 2;
+
+        app.clean_done();
+
+        assert!(app.chats.is_empty());
+        assert_eq!(app.selected, 0);
     }
 
     #[test]

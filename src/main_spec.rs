@@ -1,4 +1,7 @@
+use crate::chat::Chat;
+use crate::chat::turn::SegKind;
 use crate::flow::CapturedRequest;
+use crate::ui::TOOL_ORANGE;
 use serde_json::json;
 use crate::wire::{
     classify, detect_backend, Dir, is_llm_response, looks_like_llm, Packet, thread_key_from_body,

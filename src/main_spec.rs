@@ -1,9 +1,9 @@
 use crate::chat::Chat;
 use crate::chat::turn::SegKind;
 use crate::flow::CapturedRequest;
-use crate::transcript::{render_chat, stats_text, tool_calls_text};
 use crate::ui::TOOL_ORANGE;
 use serde_json::json;
+use crate::transcript::{render_chat, stats_text, tool_calls_text};
 use crate::wire::{
     classify, detect_backend, Dir, is_llm_response, looks_like_llm, Packet, thread_key_from_body,
     thread_key_from_headers, user_agent_from_headers,

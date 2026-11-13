@@ -2,6 +2,7 @@ mod capture;
 mod chat;
 mod flow;
 mod json;
+mod namer;
 mod subagent;
 mod text;
 mod transcript;
@@ -10,8 +11,9 @@ mod wire;
 
 use crate::chat::Chat;
 use crate::flow::Flow;
-use crate::transcript::{render_chat, Section, stats_text, turn_sections};
+use crate::namer::{name_prompt, NameResult, run_namer};
 use serde_json::Value;
+use crate::transcript::{render_chat, Section, stats_text, turn_sections};
 use crate::subagent::{briefs, looks_like_subagent_request, MIN_BRIEF_CHARS, request_plain_text};
 use crate::chat::turn::{SegKind, Turn};
 use crate::ui::{DIM, TOOL_ORANGE};
@@ -50,7 +52,7 @@ use std::{
     fs::File,
     io::{self, Write},
     path::PathBuf,
-    process::{Command, ExitCode, Stdio},
+    process::ExitCode,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -956,50 +958,6 @@ fn build_tab_line(items: &[(String, Style)], selected: usize, available: usize) 
         spans.push(Span::styled(ind_text(n - b), DIM));
     }
     Line::from(spans)
-}
-
-/// A chat id and the name the namer produced for it, or why it failed.
-type NameResult = (String, Result<String, String>);
-/// How much of the conversation's two ends the namer gets to read.
-const NAME_HEAD_CHARS: usize = 100;
-const NAME_TAIL_CHARS: usize = 1000;
-fn name_prompt(c: &Chat) -> String {
-    let first_user = c
-        .turns
-        .first()
-        .and_then(Turn::messages)
-        .and_then(|m| m.iter().find(|m| str_field(m, "role") == Some("user")))
-        .and_then(|m| str_field(m, "content"))
-        .map(|s| first_chars(s, NAME_HEAD_CHARS))
-        .unwrap_or_default();
-    let tail = last_chars(&c.last().answer, NAME_TAIL_CHARS);
-    format!(
-        "Name this chat conversation in 2-6 words. Reply with ONLY the name, no quotes, no trailing punctuation.\n\nFirst user message (first {NAME_HEAD_CHARS} chars):\n{first_user}\n\nEnd of conversation (last {NAME_TAIL_CHARS} chars):\n{tail}"
-    )
-}
-fn run_namer(model: &str, prompt: &str) -> Result<String, String> {
-    let namer = resolve_binary("ollama").ok_or_else(|| "ollama not found in PATH".to_string())?;
-    let mut child = Command::new(namer)
-        .args(["run", "--nowordwrap", model])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn ollama: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(prompt.as_bytes())
-            .map_err(|e| e.to_string())?;
-    }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.lines()
-        .find(|l| !l.trim().is_empty())
-        .map(|l| l.trim().to_string())
-        .ok_or_else(|| "empty model output".into())
 }
 
 const USAGE: &str = "Usage: sniff-llms [OPTIONS]\n\n  -i, --interface <name[,name…]>  Capture interface(s); repeatable and/or comma-separated.\n                                   Default: lo0 + the default-route interface on macOS/BSD,\n                                             \"any\" on Linux.\n      --no-elevate                 Do not run ngrep through sudo/pkexec.\n      --dry-run                    Print the resolved capture plan and exit.\n  -h, --help                       Show this help.\n\nPacket capture needs rights the average user does not have: sniff-llms asks\n`pkexec` (Linux desktops) or `sudo` for them once, before the terminal UI takes\nover the screen. On macOS the alternative is the ChmodBPF drop-in, which makes\n/dev/bpf* readable for a group and needs no password at all.\n";

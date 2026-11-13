@@ -2,7 +2,7 @@
 //! binaries live, how to obtain capture rights, and the `ngrep` processes that
 //! feed `Packet`s to the UI.
 
-use crate::Packet;
+use crate::wire::Packet;
 use std::{
     env, fs,
     io::{self, BufRead, BufReader},

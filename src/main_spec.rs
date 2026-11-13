@@ -1,5 +1,9 @@
-use crate::text::{first_chars, format_duration, last_chars, middle_elide};
+use crate::wire::{
+    classify, detect_backend, Dir, is_llm_response, looks_like_llm, Packet, thread_key_from_body,
+    thread_key_from_headers, user_agent_from_headers,
+};
 use serde_json::json;
+use crate::text::{first_chars, format_duration, last_chars, middle_elide};
 use super::*;
 
 #[test]

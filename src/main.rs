@@ -216,6 +216,42 @@ impl Turn {
     fn messages(&self) -> Option<&[Value]> {
         self.request.as_ref().and_then(request_messages)
     }
+    /// Tool-call arguments stream as many small deltas; concatenate them per
+    /// call (keyed by the delta `index`, else its position) instead of one
+    /// line each.
+    fn apply_tool_delta(&mut self, pos: usize, call: &Value) {
+        let idx = call
+            .get("index")
+            .and_then(Value::as_u64)
+            .map_or(pos, |i| i as usize);
+        while self.tool_calls.len() <= idx {
+            self.tool_calls.push(ToolCall::default());
+        }
+        let tc = &mut self.tool_calls[idx];
+        let mut label = String::new();
+        if tc.id.is_empty() {
+            tc.id = str_field(call, "id").map(str::to_owned).unwrap_or_default();
+        }
+        if tc.name.is_empty() {
+            tc.name = call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_default();
+            label.push_str(&tc.name);
+        }
+        if let Some(args) = call.pointer("/function/arguments") {
+            let frag = text_of(args, false);
+            if !frag.is_empty() && !label.is_empty() {
+                label.push(' ');
+            }
+            label.push_str(&frag);
+            tc.arguments.push_str(&frag);
+        }
+        // Count the tool name too, so a call with empty arguments
+        // still produces a tool segment (and turns the tab orange).
+        self.push_tool(idx, &label);
+    }
     /// Apply one streamed response chunk to this turn. Returns false when the
     /// chunk carries no `choices[0]` — usage/timings still count, nothing else
     /// does. (Mirrors the early return the caller used to make inline.)
@@ -241,42 +277,7 @@ impl Turn {
         }
         if let Some(calls) = delta.and_then(tool_calls_of) {
             for (pos, call) in calls.iter().enumerate() {
-                // Tool-call arguments stream as many small deltas; concatenate them
-                // per call (keyed by the delta `index`) instead of one line each.
-                let idx = call
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .map(|i| i as usize)
-                    .unwrap_or(pos);
-                while self.tool_calls.len() <= idx {
-                    self.tool_calls.push(ToolCall::default());
-                }
-                let mut label = String::new();
-                {
-                    let tc = &mut self.tool_calls[idx];
-                    if tc.id.is_empty() {
-                        tc.id = str_field(call, "id").map(str::to_owned).unwrap_or_default();
-                    }
-                    if tc.name.is_empty() {
-                        tc.name = call
-                            .pointer("/function/name")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                            .unwrap_or_default();
-                        label.push_str(&tc.name);
-                    }
-                }
-                if let Some(args) = call.pointer("/function/arguments") {
-                    let frag = text_of(args, false);
-                    if !frag.is_empty() && !label.is_empty() {
-                        label.push(' ');
-                    }
-                    label.push_str(&frag);
-                    self.tool_calls[idx].arguments.push_str(&frag);
-                }
-                // Count the tool name too, so a call with empty arguments
-                // still produces a tool segment (and turns the tab orange).
-                self.push_tool(idx, &label);
+                self.apply_tool_delta(pos, call);
             }
         }
         if let Some(s) = str_field(choice, "finish_reason") {

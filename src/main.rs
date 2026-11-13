@@ -1,5 +1,8 @@
 mod capture;
+mod json;
 
+use crate::json::{number_at, request_messages, str_field, str_or, text_of, tool_calls_of};
+use serde_json::Value;
 use capture::{
     Elevation, check_interfaces, choose_elevation, default_interfaces, reap, requested_interfaces,
     resolve_binary, start_capture,
@@ -20,7 +23,6 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Paragraph, Wrap},
 };
-use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -1090,34 +1092,6 @@ fn parse_header(s: &str) -> Option<(&str, &str)> {
     }
     Some((src, p.next()?))
 }
-fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
-    v.get(key).and_then(Value::as_str)
-}
-
-fn str_or<'a>(v: &'a Value, key: &str, default: &'a str) -> &'a str {
-    str_field(v, key).unwrap_or(default)
-}
-
-fn request_messages<'a>(v: &'a Value) -> Option<&'a [Value]> {
-    v.get("messages").and_then(Value::as_array).map(Vec::as_slice)
-}
-/// The `tool_calls` array of a message or a streamed delta.
-fn tool_calls_of(v: &Value) -> Option<&[Value]> {
-    v.get("tool_calls").and_then(Value::as_array).map(Vec::as_slice)
-}
-
-fn text_of(v: &Value, pretty: bool) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        other => {
-            if pretty {
-                serde_json::to_string_pretty(other).unwrap_or_default()
-            } else {
-                other.to_string()
-            }
-        }
-    }
-}
 
 fn is_request(v: &Value) -> bool {
     v.get("messages").is_some_and(Value::is_array) || v.get("prompt").is_some_and(Value::is_string)
@@ -1420,11 +1394,6 @@ fn compact_arguments(raw: &str) -> String {
     }
 }
 
-fn number_at<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
-    keys.iter()
-        .find_map(|key| value.get(*key))
-        .filter(|v| v.is_number())
-}
 /// A stat that may be missing from the server's report.
 fn shown(number: Option<&Value>) -> String {
     number.map_or("?".into(), Value::to_string)

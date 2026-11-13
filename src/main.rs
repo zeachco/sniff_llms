@@ -1414,7 +1414,7 @@ fn stats_text(c: &Chat) -> String {
     }
     let tool_count = c
         .tool_calls()
-        .filter(|tc| !tc.id.is_empty() || !tc.name.is_empty() || !tc.arguments.is_empty())
+        .filter(|tc| !tc.is_empty())
         .count();
     if tool_count > 0 {
         stats.push(format!("Tool calls: {tool_count}"));
@@ -1498,14 +1498,7 @@ fn extract_objects(buffer: &mut String) -> Vec<Value> {
     *buffer = if let Some(i) = start {
         buffer[i..].to_owned()
     } else {
-        buffer[consumed..]
-            .chars()
-            .rev()
-            .take(4096)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect()
+        last_chars(&buffer[consumed..], 4096)
     };
     out
 }
@@ -1681,7 +1674,6 @@ struct Timeline {
 fn timeline_body(c: &Chat, active: Option<usize>) -> Timeline {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut segments: Vec<Option<usize>> = Vec::new();
-    let dim = DIM;
     let turns = c.turns.len();
     let mut flat = 0usize;
     for (index, turn) in c.turns.iter().enumerate() {
@@ -1712,13 +1704,13 @@ fn timeline_body(c: &Chat, active: Option<usize>) -> Timeline {
         if index + 1 < turns {
             lines.push(Line::from(Span::styled(
                 format!("  ── turn {} ──", index + 2),
-                dim,
+                DIM,
             )));
             segments.push(None);
         }
     }
     if lines.is_empty() {
-        lines.push(Line::from(Span::styled("  (no output yet)", dim)));
+        lines.push(Line::from(Span::styled("  (no output yet)", DIM)));
         segments.push(None);
     }
     Timeline {
@@ -1852,10 +1844,9 @@ fn build_tab_line(items: &[(String, Style)], selected: usize, available: usize) 
     while a > 0 && fits(a - 1, b) {
         a -= 1;
     }
-    let dim = DIM;
     let mut spans: Vec<Span> = Vec::new();
     if a > 0 {
-        spans.push(Span::styled(ind_text(a), dim));
+        spans.push(Span::styled(ind_text(a), DIM));
         spans.push(Span::raw(sep));
     }
     let sel_text = &items[sel].0;
@@ -1876,7 +1867,7 @@ fn build_tab_line(items: &[(String, Style)], selected: usize, available: usize) 
     }
     if b < n {
         spans.push(Span::raw(sep));
-        spans.push(Span::styled(ind_text(n - b), dim));
+        spans.push(Span::styled(ind_text(n - b), DIM));
     }
     Line::from(spans)
 }

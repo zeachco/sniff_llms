@@ -1160,7 +1160,7 @@ fn timeline_tracks_thinking_answer_and_tool_segments() {
     );
     assert_eq!(
         chat.state_color(),
-        Color::Rgb(255, 165, 0),
+        TOOL_ORANGE,
         "last output was a tool call"
     );
     let timeline = timeline_body(chat, None).text.to_string();

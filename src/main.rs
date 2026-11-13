@@ -1,7 +1,7 @@
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-        MouseEventKind,
+        MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -331,6 +331,15 @@ impl Chat {
             scroll: 0,
             follow: true,
         }
+    }
+    /// Scrolling back stops following the stream; scrolling forward does not
+    /// resume it (End does).
+    fn scroll_up(&mut self, rows: u16) {
+        self.follow = false;
+        self.scroll = self.scroll.saturating_sub(rows);
+    }
+    fn scroll_down(&mut self, rows: u16) {
+        self.scroll = self.scroll.saturating_add(rows);
     }
     fn id(&self) -> &str {
         &self.turns[0].id
@@ -1889,6 +1898,8 @@ fn last_chars(s: &str, n: usize) -> String {
         .rev()
         .collect()
 }
+/// A chat id and the name the namer produced for it, or why it failed.
+type NameResult = (String, Result<String, String>);
 fn name_prompt(c: &Chat) -> String {
     let first_user = c
         .turns
@@ -2494,146 +2505,132 @@ fn restore(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
 }
 
 /// Handle one terminal event. Returns false when the app should quit.
-fn handle_event(
-    app: &mut App,
-    event: Event,
-    name_tx: &mpsc::Sender<(String, Result<String, String>)>,
-) -> bool {
-    match event {
-        Event::Mouse(mouse) => {
-            match mouse.kind {
-                // A click on the timeline jumps the body to that segment.
-                MouseEventKind::Down(MouseButton::Left)
-                    if app.timeline_area.contains(Position {
-                        x: mouse.column,
-                        y: mouse.row,
-                    }) =>
-                {
-                    let row =
-                        (mouse.row as usize).saturating_sub(app.timeline_area.y as usize + 1);
-                    if let Some(&Some(flat)) = app.timeline_segments.get(row)
-                        && let Some(&anchor) = app.body_anchors.get(flat)
-                        && let Some(c) = app.chats.get_mut(app.selected)
-                    {
-                        c.follow = false;
-                        c.scroll = anchor.min(u16::MAX as usize) as u16;
-                    }
-                }
-                // The wheel over the body scrolls it (and stops following).
-                MouseEventKind::ScrollUp
-                    if app.body_area.contains(Position {
-                        x: mouse.column,
-                        y: mouse.row,
-                    }) =>
-                {
-                    if let Some(c) = app.chats.get_mut(app.selected) {
-                        c.follow = false;
-                        c.scroll = c.scroll.saturating_sub(3);
-                    }
-                }
-                MouseEventKind::ScrollDown
-                    if app.body_area.contains(Position {
-                        x: mouse.column,
-                        y: mouse.row,
-                    }) =>
-                {
-                    if let Some(c) = app.chats.get_mut(app.selected) {
-                        c.scroll = c.scroll.saturating_add(3);
-                    }
-                }
-                _ => {}
+/// Rows the body moves per mouse-wheel notch.
+const WHEEL_ROWS: u16 = 3;
+
+fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    let at = Position {
+        x: mouse.column,
+        y: mouse.row,
+    };
+    let over_body = app.body_area.contains(at);
+    match mouse.kind {
+        // A click on the timeline jumps the body to that segment.
+        MouseEventKind::Down(MouseButton::Left) if app.timeline_area.contains(at) => {
+            let row = (mouse.row as usize).saturating_sub(app.timeline_area.y as usize + 1);
+            if let Some(&Some(flat)) = app.timeline_segments.get(row)
+                && let Some(&anchor) = app.body_anchors.get(flat)
+                && let Some(c) = app.chats.get_mut(app.selected)
+            {
+                c.follow = false;
+                c.scroll = anchor.min(u16::MAX as usize) as u16;
             }
+        }
+        // The wheel over the body scrolls it.
+        MouseEventKind::ScrollUp if over_body => {
+            if let Some(c) = app.chats.get_mut(app.selected) {
+                c.scroll_up(WHEEL_ROWS);
+            }
+        }
+        MouseEventKind::ScrollDown if over_body => {
+            if let Some(c) = app.chats.get_mut(app.selected) {
+                c.scroll_down(WHEEL_ROWS);
+            }
+        }
+        _ => {}
+    }
+}
+/// Keys while the rename prompt is open.
+fn handle_rename_key(app: &mut App, code: KeyCode) {
+    let Some(buf) = app.rename.as_mut() else {
+        return;
+    };
+    match code {
+        KeyCode::Char(c) => buf.push(c),
+        KeyCode::Backspace => {
+            buf.pop();
+        }
+        KeyCode::Enter => app.rename_commit(),
+        KeyCode::Esc => {
+            app.rename = None;
+            app.status = "rename cancelled".into();
+        }
+        _ => {}
+    }
+}
+/// Ask the local model for a name; the answer comes back on `name_tx`.
+fn start_ai_naming(app: &mut App, name_tx: &mpsc::Sender<NameResult>) {
+    let Some(c) = app.chats.get(app.selected) else {
+        app.status = "no chat to name".into();
+        return;
+    };
+    let prompt = name_prompt(c);
+    let id = c.id().to_owned();
+    let model = env::var("SNIFF_NAMER").unwrap_or_else(|_| "gemma4:e2b".into());
+    let tx = name_tx.clone();
+    app.status = format!("ai-naming with {model}…");
+    thread::spawn(move || {
+        let res = run_namer(&model, &prompt);
+        let _ = tx.send((id, res));
+    });
+}
+/// Returns false when the user quits.
+fn handle_event(app: &mut App, event: Event, name_tx: &mpsc::Sender<NameResult>) -> bool {
+    let code = match event {
+        Event::Mouse(mouse) => {
+            handle_mouse(app, mouse);
             return true;
         }
-        Event::Key(k) => {
-            if k.kind != KeyEventKind::Press {
-                return true;
-            }
-            if app.rename.is_some() {
-                match k.code {
-                    KeyCode::Char(c) => {
-                        if let Some(buf) = app.rename.as_mut() {
-                            buf.push(c)
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        if let Some(buf) = app.rename.as_mut() {
-                            buf.pop();
-                        }
-                    }
-                    KeyCode::Enter => app.rename_commit(),
-                    KeyCode::Esc => {
-                        app.rename = None;
-                        app.status = "rename cancelled".into();
-                    }
-                    _ => {}
-                }
-                return true;
-            }
-            match k.code {
-                KeyCode::Char('q') => return false,
-                KeyCode::Left if !app.chats.is_empty() => {
-                    app.selected = app.selected.checked_sub(1).unwrap_or(app.chats.len() - 1)
-                }
-                KeyCode::Right if !app.chats.is_empty() => {
-                    app.selected = (app.selected + 1) % app.chats.len()
-                }
-                KeyCode::Up => {
-                    let Some(c) = app.chats.get_mut(app.selected) else {
-                        return true;
-                    };
-                    c.follow = false;
-                    c.scroll = c.scroll.saturating_sub(1)
-                }
-                KeyCode::Down => {
-                    let Some(c) = app.chats.get_mut(app.selected) else {
-                        return true;
-                    };
-                    c.scroll = c.scroll.saturating_add(1)
-                }
-                KeyCode::End => {
-                    let Some(c) = app.chats.get_mut(app.selected) else {
-                        return true;
-                    };
-                    c.follow = true
-                }
-                KeyCode::Char('x') => app.close(),
-                KeyCode::Char('X') => app.clean_done(),
-                KeyCode::Char('m') => app.merge_prev(),
-                KeyCode::Char('g') => app.group(),
-                KeyCode::Char('u') => app.ungroup(),
-                KeyCode::Char('d') => app.dump(),
-                KeyCode::Char('a') => {
-                    app.auto_clean = app.auto_clean.next();
-                    app.status = format!("auto-clean: {}", app.auto_clean.label())
-                }
-                KeyCode::Char('r') => {
-                    if app.chats.is_empty() {
-                        app.status = "no chat to rename".into()
-                    } else {
-                        app.rename = Some(String::new());
-                        app.status = "rename".into()
-                    }
-                }
-                KeyCode::Char('R') => {
-                    let Some(c) = app.chats.get(app.selected) else {
-                        app.status = "no chat to name".into();
-                        return true;
-                    };
-                    let prompt = name_prompt(c);
-                    let id = c.id().to_owned();
-                    let model = env::var("SNIFF_NAMER").unwrap_or_else(|_| "gemma4:e2b".into());
-                    let tx = name_tx.clone();
-                    app.status = format!("ai-naming with {model}…");
-                    thread::spawn(move || {
-                        let res = run_namer(&model, &prompt);
-                        let _ = tx.send((id, res));
-                    });
-                }
-                _ => {}
+        Event::Key(k) if k.kind == KeyEventKind::Press => k.code,
+        _ => return true,
+    };
+    if app.rename.is_some() {
+        handle_rename_key(app, code);
+        return true;
+    }
+    match code {
+        KeyCode::Char('q') => return false,
+        KeyCode::Left if !app.chats.is_empty() => {
+            app.selected = app.selected.checked_sub(1).unwrap_or(app.chats.len() - 1)
+        }
+        KeyCode::Right if !app.chats.is_empty() => {
+            app.selected = (app.selected + 1) % app.chats.len()
+        }
+        KeyCode::Up => {
+            if let Some(c) = app.chats.get_mut(app.selected) {
+                c.scroll_up(1)
             }
         }
-        _ => return true,
+        KeyCode::Down => {
+            if let Some(c) = app.chats.get_mut(app.selected) {
+                c.scroll_down(1)
+            }
+        }
+        KeyCode::End => {
+            if let Some(c) = app.chats.get_mut(app.selected) {
+                c.follow = true
+            }
+        }
+        KeyCode::Char('x') => app.close(),
+        KeyCode::Char('X') => app.clean_done(),
+        KeyCode::Char('m') => app.merge_prev(),
+        KeyCode::Char('g') => app.group(),
+        KeyCode::Char('u') => app.ungroup(),
+        KeyCode::Char('d') => app.dump(),
+        KeyCode::Char('a') => {
+            app.auto_clean = app.auto_clean.next();
+            app.status = format!("auto-clean: {}", app.auto_clean.label())
+        }
+        KeyCode::Char('r') => {
+            if app.chats.is_empty() {
+                app.status = "no chat to rename".into()
+            } else {
+                app.rename = Some(String::new());
+                app.status = "rename".into()
+            }
+        }
+        KeyCode::Char('R') => start_ai_naming(app, name_tx),
+        _ => {}
     }
     true
 }
@@ -2693,7 +2690,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let mut app = App::new();
-    let (name_tx, name_rx) = mpsc::channel::<(String, Result<String, String>)>();
+    let (name_tx, name_rx) = mpsc::channel::<NameResult>();
     let mut last_reap = Instant::now();
     let result = loop {
         while let Ok(p) = rx.try_recv() {

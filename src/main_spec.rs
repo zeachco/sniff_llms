@@ -1,15 +1,22 @@
+use crate::app::{App, AutoClean};
+use crate::capture::{requested_interfaces, resolve_binary};
 use crate::chat::Chat;
 use crate::chat::turn::SegKind;
 use crate::flow::CapturedRequest;
-use crate::ui::TOOL_ORANGE;
-use serde_json::json;
+use crate::text::{first_chars, format_duration, last_chars, middle_elide};
 use crate::transcript::{render_chat, stats_text, tool_calls_text};
+use crate::ui::TOOL_ORANGE;
+use crate::ui::body::{render_body, segment_anchor_rows};
+use crate::ui::tab_bar::build_tab_line;
+use crate::ui::timeline::timeline_body;
 use crate::wire::{
-    classify, detect_backend, Dir, is_llm_response, looks_like_llm, Packet, thread_key_from_body,
+    Dir, Packet, classify, detect_backend, is_llm_response, looks_like_llm, thread_key_from_body,
     thread_key_from_headers, user_agent_from_headers,
 };
-use crate::text::{first_chars, format_duration, last_chars, middle_elide};
-use super::*;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Line;
+use serde_json::{Value, json};
+use std::time::{Duration, Instant};
 
 #[test]
 fn parses_repeated_and_comma_separated_interfaces() {

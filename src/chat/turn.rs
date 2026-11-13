@@ -1,7 +1,8 @@
 //! One response of a conversation: its streamed text, its tool calls and the
 //! timeline segments they arrive in.
 
-use crate::{Duration, Instant, request_messages, str_field, text_of, tool_calls_of};
+use crate::chat::{Duration, Instant};
+use crate::json::{request_messages, str_field, text_of, tool_calls_of};
 use serde_json::Value;
 
 #[derive(Default)]
@@ -42,7 +43,7 @@ impl SegKind {
 pub(crate) struct Segment {
     pub(crate) kind: SegKind,
     pub(crate) chars: usize,
-    pub(crate) started: Instant,
+    started: Instant,
     pub(crate) ended: Option<Instant>,
     /// For tool segments: index into `Turn::tool_calls` of the call that
     /// generated the segment, so the timeline can anchor to the call's line
@@ -93,7 +94,7 @@ impl Turn {
     }
     /// Extend the active segment of `kind`, or close the previous one and start
     /// a new segment when the kind changes.
-    pub(crate) fn push(&mut self, kind: SegKind, text: &str) {
+    fn push(&mut self, kind: SegKind, text: &str) {
         let chars = text.chars().count();
         if chars == 0 {
             return;
@@ -119,7 +120,7 @@ impl Turn {
     /// Like `push`, but records which tool call generated the text. Consecutive
     /// deltas of one call (or several calls in one delta) merge into a single
     /// segment that keeps the index of the first call.
-    pub(crate) fn push_tool(&mut self, call: usize, text: &str) {
+    fn push_tool(&mut self, call: usize, text: &str) {
         let fresh = self
             .segments
             .last()
@@ -129,7 +130,7 @@ impl Turn {
             last.tool_call = Some(call);
         }
     }
-    pub(crate) fn close_active(&mut self) {
+    fn close_active(&mut self) {
         if let Some(last) = self.segments.last_mut() {
             last.ended.get_or_insert_with(Instant::now);
         }
@@ -142,7 +143,7 @@ impl Turn {
     /// Tool-call arguments stream as many small deltas; concatenate them per
     /// call (keyed by the delta `index`, else its position) instead of one
     /// line each.
-    pub(crate) fn apply_tool_delta(&mut self, pos: usize, call: &Value) {
+    fn apply_tool_delta(&mut self, pos: usize, call: &Value) {
         let idx = call
             .get("index")
             .and_then(Value::as_u64)

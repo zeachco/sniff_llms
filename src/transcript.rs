@@ -1,14 +1,14 @@
 //! The plain-text rendering of a chat: the stats block and the per-turn
 //! sections shared by the dump file and the body pane.
 
-use crate::{
-    Chat, compact_arguments, middle_elide, number_at, request_messages, str_or, text_of,
-    tool_calls_of, Turn,
-};
+use crate::chat::Chat;
+use crate::chat::turn::Turn;
+use crate::json::{number_at, request_messages, str_or, text_of, tool_calls_of};
+use crate::text::{compact_arguments, middle_elide};
 use serde_json::Value;
 
 /// A stat that may be missing from the server's report.
-pub(crate) fn shown(number: Option<&Value>) -> String {
+fn shown(number: Option<&Value>) -> String {
     number.map_or("?".into(), Value::to_string)
 }
 
@@ -72,7 +72,7 @@ pub(crate) fn stats_text(c: &Chat) -> String {
     stats.join("\n")
 }
 
-pub(crate) fn messages_text(messages: &[Value], skip: usize) -> String {
+fn messages_text(messages: &[Value], skip: usize) -> String {
     let mut out = String::new();
     for m in messages.iter().skip(skip) {
         let role = str_or(m, "role", "unknown");
@@ -97,7 +97,7 @@ pub(crate) fn messages_text(messages: &[Value], skip: usize) -> String {
     out
 }
 
-pub(crate) fn request_text(request: Option<&Value>) -> String {
+fn request_text(request: Option<&Value>) -> String {
     let Some(r) = request else {
         return "(request began before capture)".into();
     };
@@ -110,7 +110,7 @@ pub(crate) fn request_text(request: Option<&Value>) -> String {
 
 /// Only the messages a continuation turn added, so a long conversation is not
 /// printed again for every tool round trip.
-pub(crate) fn request_delta_text(previous: Option<&Value>, current: Option<&Value>) -> String {
+fn request_delta_text(previous: Option<&Value>, current: Option<&Value>) -> String {
     let (Some(previous), Some(current)) = (previous, current) else {
         return request_text(current);
     };
@@ -129,7 +129,7 @@ pub(crate) fn request_delta_text(previous: Option<&Value>, current: Option<&Valu
     messages_text(new, common)
 }
 
-pub(crate) fn turn_request_text(turns: &[Turn], index: usize) -> String {
+fn turn_request_text(turns: &[Turn], index: usize) -> String {
     let turn = &turns[index];
     match index.checked_sub(1) {
         Some(previous) => {

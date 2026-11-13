@@ -1,6 +1,10 @@
 //! Naming a chat with a local model.
 
-use crate::{Chat, first_chars, last_chars, resolve_binary, str_field, Turn};
+use crate::capture::resolve_binary;
+use crate::chat::Chat;
+use crate::chat::turn::Turn;
+use crate::json::str_field;
+use crate::text::{first_chars, last_chars};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -8,9 +12,9 @@ use std::process::{Command, Stdio};
 pub(crate) type NameResult = (String, Result<String, String>);
 
 /// How much of the conversation's two ends the namer gets to read.
-pub(crate) const NAME_HEAD_CHARS: usize = 100;
+const NAME_HEAD_CHARS: usize = 100;
 
-pub(crate) const NAME_TAIL_CHARS: usize = 1000;
+const NAME_TAIL_CHARS: usize = 1000;
 
 pub(crate) fn name_prompt(c: &Chat) -> String {
     let first_user = c

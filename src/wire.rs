@@ -1,7 +1,8 @@
 //! Reading what ngrep hands over: packet headers, HTTP framing, direction,
 //! JSON objects split across packets, and the thread identity a client declares.
 
-use crate::{last_chars, str_field};
+use crate::json::str_field;
+use crate::text::last_chars;
 use serde_json::Value;
 
 pub(crate) struct Packet {
@@ -76,7 +77,7 @@ pub(crate) fn looks_like_llm(payload: &str) -> bool {
 
 /// Headers a client uses to declare a stable conversation identity. The value
 /// is the same on every request of one thread, unlike response ids.
-pub(crate) const THREAD_HEADERS: &[&str] = &[
+const THREAD_HEADERS: &[&str] = &[
     "x-session-id",
     "x-session-affinity",
     "session-id",
@@ -93,7 +94,7 @@ pub(crate) const THREAD_HEADERS: &[&str] = &[
 ];
 
 /// Body fields some clients use for the same purpose.
-pub(crate) const THREAD_BODY_FIELDS: &[&str] = &[
+const THREAD_BODY_FIELDS: &[&str] = &[
     "prompt_cache_key",
     "conversation_id",
     "session_id",
@@ -102,7 +103,7 @@ pub(crate) const THREAD_BODY_FIELDS: &[&str] = &[
 
 /// Shorter values are too generic to identify a thread (`1`, `default`) and
 /// are ignored, leaving the content heuristics in charge.
-pub(crate) const MIN_THREAD_KEY_LEN: usize = 8;
+const MIN_THREAD_KEY_LEN: usize = 8;
 
 pub(crate) fn thread_key_from_headers(payload: &str) -> Option<String> {
     for line in payload.lines() {
@@ -162,7 +163,7 @@ pub(crate) fn thread_key_from_body(body: &Value) -> Option<String> {
 }
 
 /// First balanced JSON object in `s`, scanning past SSE `data:` prefixes.
-pub(crate) fn first_json(s: &str) -> Option<Value> {
+fn first_json(s: &str) -> Option<Value> {
     let start = s.find('{')?;
     let bytes = s.as_bytes();
     let mut depth = 0usize;
@@ -236,7 +237,7 @@ pub(crate) fn classify(payload: &str) -> Option<Dir> {
 // here — objects are only complete once brace depth returns to zero inside
 // this growing buffer. The tail cap keeps a long non-JSON prefix from growing
 // the buffer without bound.
-pub(crate) const NON_JSON_TAIL_CHARS: usize = 4096;
+const NON_JSON_TAIL_CHARS: usize = 4096;
 
 pub(crate) fn extract_objects(buffer: &mut String) -> Vec<Value> {
     let mut out = vec![];

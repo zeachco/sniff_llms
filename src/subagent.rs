@@ -1,7 +1,7 @@
 //! Recognising subagent traffic: the tools that spawn one, the requests one
 //! sends, and the brief a parent passes down.
 
-use crate::{request_messages, text_of};
+use crate::json::{request_messages, text_of};
 use serde_json::Value;
 
 /// Tool names a harness uses to spawn a child generation. Cindy/pi's subagent
@@ -36,7 +36,7 @@ pub(crate) fn looks_like_subagent_request(request: &Value) -> bool {
 pub(crate) const MIN_BRIEF_CHARS: usize = 40;
 
 /// Bytes of request text scanned for a brief; huge histories stop here.
-pub(crate) const REQUEST_TEXT_SCAN_CAP: usize = 256 * 1024;
+const REQUEST_TEXT_SCAN_CAP: usize = 256 * 1024;
 
 /// Unescaped text of a request's messages, for substring matching against the
 /// brief a parent passed to its subagent tool.

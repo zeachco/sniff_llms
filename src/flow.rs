@@ -1,7 +1,7 @@
 //! One TCP connection between a client and an LLM server, and the requests
 //! seen on it that are still waiting for their response.
 
-use crate::thread_key_from_body;
+use crate::wire::thread_key_from_body;
 use serde_json::Value;
 
 #[derive(Default)]
@@ -19,7 +19,7 @@ pub(crate) struct Flow {
 }
 
 /// Captured requests kept per flow; the oldest is dropped first.
-pub(crate) const MAX_CAPTURED_REQUESTS: usize = 20;
+const MAX_CAPTURED_REQUESTS: usize = 20;
 
 impl Flow {
     pub(crate) fn capture_request(&mut self, body: Value) {

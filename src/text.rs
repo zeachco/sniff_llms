@@ -1,7 +1,7 @@
 //! String shaping for the UI: eliding, truncating, compacting and durations.
 
-use crate::Duration;
 use serde_json::Value;
+use std::time::Duration;
 
 pub(crate) fn safe_name(s: &str) -> String {
     s.chars()

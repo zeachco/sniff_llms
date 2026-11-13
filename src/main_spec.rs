@@ -472,13 +472,7 @@ fn continuation_after_tool_call_extends_the_same_chat() {
     app.packet(request_body(5000, first_request()));
     app.packet(response_packet(
         5000,
-        delta_response(
-            "c1",
-            json!({"tool_calls": [
-                {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{\"q\":\"file\"}"}}
-            ]}),
-            Some("tool_calls"),
-        ),
+        tool_call_response("c1", "call_1", "search", "{\"q\":\"file\"}"),
     ));
     // The client comes back on a fresh connection with the tool result.
     app.packet(request_body(5001, continuation_request()));
@@ -512,9 +506,7 @@ fn continuation_matches_by_tool_call_id_without_a_previous_request() {
     // The previous request was never captured (capture started mid-flight).
     app.response(
         "f",
-        json!({"id": "c1", "choices": [{"delta": {"tool_calls": [
-            {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{}"}}
-        ]}, "finish_reason": "tool_calls"}]}),
+        tool_call_response("c1", "call_1", "search", "{}"),
     );
     // The new request has different leading messages (dynamic system
     // prompt) but echoes the tool-call id emitted by turn 1.
@@ -535,7 +527,7 @@ fn continuation_matches_by_tool_call_id_without_a_previous_request() {
         .to_string(),
     });
     app.response(
-        "127.0.0.1:5001 <-> 127.0.0.1:8080",
+        &flow_key(5001),
         delta_response("c2", json!({"content": "done"}), None),
     );
 
@@ -578,16 +570,23 @@ fn response_packet(client_port: u16, body: Value) -> Packet {
     }
 }
 
+/// A finished response whose only output is one tool call.
+fn tool_call_response(id: &str, call_id: &str, name: &str, arguments: &str) -> Value {
+    delta_response(
+        id,
+        json!({"tool_calls": [
+            {"index": 0, "id": call_id, "function": {"name": name, "arguments": arguments}}
+        ]}),
+        Some("tool_calls"),
+    )
+}
 fn subagent_parent_response(id: &str, brief: &str) -> Value {
-    json!({
-        "id": id,
-        "choices": [{"delta": {"tool_calls": [{
-            "index": 0, "id": format!("call_{id}"),
-            "function": {"name": "subagent", "arguments": json!({
-                "agent": "reviewer", "task": brief
-            }).to_string()}
-        }]}, "finish_reason": "tool_calls"}]
-    })
+    let arguments = json!({"agent": "reviewer", "task": brief}).to_string();
+    tool_call_response(id, &format!("call_{id}"), "subagent", &arguments)
+}
+/// The flow key of a loopback client on `port` talking to the server on 8080.
+fn flow_key(port: u16) -> String {
+    format!("127.0.0.1:{port} <-> 127.0.0.1:8080")
 }
 
 #[test]
@@ -631,7 +630,7 @@ fn subagent_request_groups_to_the_parent_with_matching_brief() {
         }),
     ));
     app.response(
-        "127.0.0.1:5000 <-> 127.0.0.1:8080",
+        &flow_key(5000),
         delta_response("s1", json!({"content": "reviewing"}), None),
     );
 
@@ -652,15 +651,11 @@ fn shared_thread_id_is_disambiguated_by_tool_call_id() {
     let mut app = App::new();
     app.response(
         "f",
-        json!({"id": "p1", "choices": [{"delta": {"tool_calls": [
-            {"index": 0, "id": "call_p", "function": {"name": "search", "arguments": "{}"}}
-        ]}, "finish_reason": "tool_calls"}]}),
+        tool_call_response("p1", "call_p", "search", "{}"),
     );
     app.response(
         "g",
-        json!({"id": "s1", "choices": [{"delta": {"tool_calls": [
-            {"index": 0, "id": "call_s", "function": {"name": "search", "arguments": "{}"}}
-        ]}, "finish_reason": "tool_calls"}]}),
+        tool_call_response("s1", "call_s", "search", "{}"),
     );
     // A harness may send the same root session id for a parent and its
     // subagent. Content must still route each follow-up to its own chat.
@@ -683,13 +678,13 @@ fn shared_thread_id_is_disambiguated_by_tool_call_id() {
     app.packet(request_start(5000, &[]));
     app.packet(request_body(5000, next_request("call_s")));
     app.response(
-        "127.0.0.1:5000 <-> 127.0.0.1:8080",
+        &flow_key(5000),
         delta_response("c3", json!({"content": "child continued"}), None),
     );
     app.packet(request_start(5001, &[]));
     app.packet(request_body(5001, next_request("call_p")));
     app.response(
-        "127.0.0.1:5001 <-> 127.0.0.1:8080",
+        &flow_key(5001),
         delta_response("c4", json!({"content": "parent continued"}), None),
     );
 
@@ -713,7 +708,7 @@ fn normal_conversation_is_not_grouped_under_a_waiting_parent() {
         json!({"model": "qwen", "messages": [{"role": "user", "content": "unrelated question"}]}),
     ));
     app.response(
-        "127.0.0.1:5000 <-> 127.0.0.1:8080",
+        &flow_key(5000),
         delta_response("c2", json!({"content": "answer"}), None),
     );
 
@@ -759,7 +754,7 @@ fn mirrored_leg_contributes_thread_id_and_request() {
         json!({"model": "qwen", "messages": [{"role": "user", "content": "hi"}]}),
     ));
     app.response(
-        "127.0.0.1:5000 <-> 127.0.0.1:8080",
+        &flow_key(5000),
         delta_response("c1", json!({"content": "hello"}), None),
     );
 
@@ -785,7 +780,7 @@ fn request_user_agent_labels_the_chat_and_the_stats_line() {
         json!({"model": "qwen", "messages": [{"role": "user", "content": "hi"}]}),
     ));
     app.response(
-        "127.0.0.1:5000 <-> 127.0.0.1:8080",
+        &flow_key(5000),
         delta_response("c1", json!({"content": "hello"}), Some("stop")),
     );
 
@@ -849,9 +844,7 @@ fn different_header_thread_ids_never_merge_even_with_matching_tool_ids() {
     ));
     app.packet(response_packet(
         5000,
-        json!({"id": "c1", "choices": [{"delta": {"tool_calls": [
-            {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{}"}}
-        ]}, "finish_reason": "tool_calls"}]}),
+        tool_call_response("c1", "call_1", "search", "{}"),
     ));
     // Same tool-call id, but the client declares another thread.
     app.packet(request_start(5001, &[("x-session-id", "thread-bbbbbbbb")]));
@@ -956,9 +949,7 @@ fn continuation_on_the_same_connection_regroups_when_request_was_missed() {
     // Only the response side was captured.
     app.response(
         "client <-> server",
-        json!({"id": "c1", "choices": [{"delta": {"tool_calls": [
-            {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{}"}}
-        ]}, "finish_reason": "tool_calls"}]}),
+        tool_call_response("c1", "call_1", "search", "{}"),
     );
     // The follow-up runs on the same keep-alive connection.
     app.response(
@@ -979,9 +970,7 @@ fn unrelated_tool_call_ids_start_a_new_chat() {
     let mut app = App::new();
     app.response(
         "f",
-        json!({"id": "c1", "choices": [{"delta": {"tool_calls": [
-            {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{}"}}
-        ]}, "finish_reason": "tool_calls"}]}),
+        tool_call_response("c1", "call_1", "search", "{}"),
     );
     app.packet(Packet {
         header: "T 127.0.0.1:5002 -> 127.0.0.1:8080".into(),
@@ -999,7 +988,7 @@ fn unrelated_tool_call_ids_start_a_new_chat() {
         .to_string(),
     });
     app.response(
-        "127.0.0.1:5002 <-> 127.0.0.1:8080",
+        &flow_key(5002),
         delta_response("c2", json!({"content": "done"}), None),
     );
     assert_eq!(
@@ -1051,9 +1040,7 @@ fn merge_prev_regroups_two_open_chats() {
     let mut app = App::new();
     app.response(
         "f",
-        json!({"id": "c1", "choices": [{"delta": {"tool_calls": [
-            {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{}"}}
-        ]}, "finish_reason": "tool_calls"}]}),
+        tool_call_response("c1", "call_1", "search", "{}"),
     );
     app.response(
         "g",
@@ -1082,14 +1069,12 @@ fn continuation_search_skips_chats_without_a_captured_request() {
     // A second, fully captured chat must still be found after skipping it.
     app.packet(request_body(5000, first_request()));
     app.response(
-        "127.0.0.1:5000 <-> 127.0.0.1:8080",
-        json!({"id": "c1", "choices": [{"delta": {"tool_calls": [
-            {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{}"}}
-        ]}, "finish_reason": "tool_calls"}]}),
+        &flow_key(5000),
+        tool_call_response("c1", "call_1", "search", "{}"),
     );
     app.packet(request_body(5001, continuation_request()));
     app.response(
-        "127.0.0.1:5001 <-> 127.0.0.1:8080",
+        &flow_key(5001),
         delta_response("c2", json!({"content": "done"}), None),
     );
 
@@ -1143,9 +1128,7 @@ fn timeline_tracks_thinking_answer_and_tool_segments() {
     );
     app.response(
         "f",
-        json!({"id": "c1", "choices": [{"delta": {"tool_calls": [
-            {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{\"q\":\"x\"}"}}
-        ]}, "finish_reason": "tool_calls"}]}),
+        tool_call_response("c1", "call_1", "search", "{\"q\":\"x\"}"),
     );
 
     let chat = &app.chats[0];
@@ -1181,9 +1164,7 @@ fn chat_with_three_segments() -> Chat {
     );
     app.response(
         "f",
-        json!({"id": "c1", "choices": [{"delta": {"tool_calls": [
-            {"index": 0, "id": "call_1", "function": {"name": "search", "arguments": "{\"q\":\"x\"}"}}
-        ]}, "finish_reason": "tool_calls"}]}),
+        tool_call_response("c1", "call_1", "search", "{\"q\":\"x\"}"),
     );
     app.chats.remove(0)
 }

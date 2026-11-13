@@ -2,9 +2,12 @@
 
 pub(crate) mod turn;
 
-use crate::{Duration, HashSet, Instant, is_subagent_tool, str_field};
-use crate::chat::turn::{ToolCall, Turn};
+use crate::str_field;
+use crate::subagent::is_subagent_tool;
 use serde_json::Value;
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
+use crate::chat::turn::{ToolCall, Turn};
 
 /// How long a chat that already finished may stay open after its last chunk:
 /// the silent gap between two turns of an interactive session, when nothing is

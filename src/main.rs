@@ -254,7 +254,7 @@ impl Turn {
     }
     /// Apply one streamed response chunk to this turn. Returns false when the
     /// chunk carries no `choices[0]` — usage/timings still count, nothing else
-    /// does. (Mirrors the early return the caller used to make inline.)
+    /// does.
     fn apply_chunk(&mut self, value: &Value) -> bool {
         if let Some(usage) = value.get("usage") {
             self.usage = Some(usage.clone());
@@ -856,6 +856,9 @@ impl App {
         self.subtree_end(parent)
     }
     fn in_subtree(&self, mut index: usize, root_id: &str) -> bool {
+        // why: a parent chain is at most chats.len() long. The bound keeps a
+        // parent cycle from looping forever: merge_prev re-points parents and
+        // can leave a chat as its own ancestor.
         for _ in 0..self.chats.len() {
             let Some(parent) = self.chats[index].parent.as_deref() else {
                 return false;
@@ -870,12 +873,10 @@ impl App {
         }
         false
     }
-    /// Manually group the selected tab under the one on its left. Useful for
-    /// conversations that were already split before grouping heuristics could
-    /// see them.
     /// Manual grouping is a two-step mark: press `g` on the parent, select the
     /// child, press `g` again. The child's subtree moves right after the
-    /// parent's group.
+    /// parent's group. Useful for conversations that were already split before
+    /// the grouping heuristics could see them.
     fn group(&mut self) {
         let Some(chat) = self.chats.get(self.selected) else {
             self.status = "no chat to group".into();
@@ -1067,10 +1068,14 @@ impl App {
 }
 fn parse_header(s: &str) -> Option<(&str, &str)> {
     let mut p = s.split_whitespace();
-    (p.next()? == "T").then_some(())?;
-    let a = p.next()?;
-    (p.next()? == "->").then_some(())?;
-    Some((a, p.next()?))
+    if p.next()? != "T" {
+        return None;
+    }
+    let src = p.next()?;
+    if p.next()? != "->" {
+        return None;
+    }
+    Some((src, p.next()?))
 }
 fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
@@ -1998,20 +2003,21 @@ fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
 /// pseudo-device, so each one has to be named and one capture per interface is
 /// the only way to watch more than a single leg.
 fn available_interfaces() -> Vec<String> {
-    let listed = if cfg!(target_os = "linux") {
-        fs::read_dir("/sys/class/net")
+    if cfg!(target_os = "linux") {
+        return fs::read_dir("/sys/class/net")
             .map(|entries| {
                 entries
                     .filter_map(Result::ok)
                     .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .join(" ")
+                    .collect()
             })
-            .unwrap_or_default()
-    } else {
-        command_stdout("ifconfig", &["-l"]).unwrap_or_default()
-    };
-    listed.split_whitespace().map(str::to_owned).collect()
+            .unwrap_or_default();
+    }
+    command_stdout("ifconfig", &["-l"])
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
 }
 
 /// What to capture when the caller did not name anything: loopback (where a
@@ -2427,8 +2433,7 @@ fn render_chat_panes(frame: &mut ratatui::Frame, app: &mut App, content: &[Rect]
                 .scroll((c.scroll, 0)),
             details[1],
         );
-        // Keep the geometry and anchors for mouse events; `c` is not used
-        // below, so the borrow of `app.chats` is over.
+        // Keep the geometry and anchors for mouse events.
         app.timeline_area = content[0];
         app.body_area = details[1];
         app.timeline_segments = segment_rows;

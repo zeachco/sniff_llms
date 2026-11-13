@@ -1394,6 +1394,9 @@ fn safe_name(s: &str) -> String {
 
 fn middle_elide(s: &str, max_chars: usize) -> String {
     let chars = s.chars().collect::<Vec<_>>();
+    // why `< 5`: below that the "..." leaves no room for a character on each
+    // side. No caller asks for so little today; the guard keeps the
+    // subtraction below from underflowing if one ever does.
     if chars.len() <= max_chars || max_chars < 5 {
         return s.into();
     }

@@ -47,6 +47,24 @@ struct Flow {
     pending_user_agent: Option<String>,
     server: Option<String>,
 }
+/// Captured requests kept per flow; the oldest is dropped first.
+const MAX_CAPTURED_REQUESTS: usize = 20;
+impl Flow {
+    fn capture_request(&mut self, body: Value) {
+        let thread = self
+            .pending_thread
+            .take()
+            .or_else(|| thread_key_from_body(&body));
+        self.requests.push(CapturedRequest {
+            body,
+            thread,
+            user_agent: self.pending_user_agent.take(),
+        });
+        if self.requests.len() > MAX_CAPTURED_REQUESTS {
+            self.requests.remove(0);
+        }
+    }
+}
 /// A captured request body plus the explicit thread identity it declared, if
 /// any (headers or body fields).
 #[derive(Clone)]
@@ -475,6 +493,43 @@ impl App {
         }
     }
 
+    /// Which way a packet travels, admitting its flow when it is new. `None`
+    /// means the packet is not LLM traffic (or the flow table is full).
+    fn resolve_direction(
+        &mut self,
+        key: &str,
+        src: &str,
+        dst: &str,
+        payload: &str,
+        framed: Option<Dir>,
+    ) -> Option<Dir> {
+        // Unframed body data on an existing flow is trusted and the direction
+        // comes from the endpoints, because mid-body segments of a large
+        // request carry no markers at all.
+        if framed.is_none()
+            && let Some(server) = self.flows.get(key).and_then(|f| f.server.as_deref())
+        {
+            return if src == server {
+                Some(Dir::Response)
+            } else if dst == server {
+                Some(Dir::Request)
+            } else {
+                None
+            };
+        }
+        // Anything else must identify itself as LLM traffic from its content:
+        // HTTP framing tells the direction outright, a bare body by its shape.
+        if !looks_like_llm(payload) {
+            return None;
+        }
+        let direction = framed.or_else(|| classify(payload))?;
+        if !self.flows.contains_key(key) && self.flows.len() >= MAX_FLOWS {
+            return None;
+        }
+        self.admit_flow(key, direction, src, dst);
+        Some(direction)
+    }
+
     fn packet(&mut self, packet: Packet) {
         let Some((src, dst)) = parse_header(&packet.header) else {
             return;
@@ -482,82 +537,35 @@ impl App {
         let mut endpoints = [src.to_owned(), dst.to_owned()];
         endpoints.sort();
         let key = endpoints.join(" <-> ");
-        let direction = match framed_direction(&packet.payload) {
-            // HTTP framing tells us the direction outright.
-            Some(d) => {
-                if !looks_like_llm(&packet.payload) {
-                    return;
-                }
-                if !self.flows.contains_key(&key) && self.flows.len() >= MAX_FLOWS {
-                    return;
-                }
-                self.admit_flow(&key, d, src, dst);
-                d
-            }
-            // Unframed body data. A brand-new flow must identify itself as LLM
-            // traffic from its content; an existing flow is trusted and the
-            // direction comes from the endpoints, because mid-body segments of a
-            // large request carry no markers at all.
-            None => {
-                if let Some(server) = self.flows.get(&key).and_then(|f| f.server.as_deref()) {
-                    if src == server {
-                        Dir::Response
-                    } else if dst == server {
-                        Dir::Request
-                    } else {
-                        return;
-                    }
-                } else {
-                    if !looks_like_llm(&packet.payload) {
-                        return;
-                    }
-                    let Some(d) = classify(&packet.payload) else {
-                        return;
-                    };
-                    if self.flows.len() >= MAX_FLOWS {
-                        return;
-                    }
-                    self.admit_flow(&key, d, src, dst);
-                    d
-                }
-            }
+        let framed = framed_direction(&packet.payload);
+        let Some(direction) = self.resolve_direction(&key, src, dst, &packet.payload, framed)
+        else {
+            return;
         };
-        let response = direction == Dir::Response;
-        let objects = {
-            let flow = self.flows.entry(key.clone()).or_default();
-            // The start of an HTTP request carries its headers. A declared
-            // session/conversation id is kept until the body object is parsed,
-            // so it can be attached to that request.
-            if !response && framed_direction(&packet.payload) == Some(Dir::Request) {
-                flow.pending_thread = thread_key_from_headers(&packet.payload);
-                flow.pending_user_agent = user_agent_from_headers(&packet.payload);
-            }
-            let buf = if response {
-                &mut flow.response_buf
-            } else {
-                &mut flow.request_buf
-            };
-            buf.push_str(&packet.payload);
-            buf.push('\n');
-            extract_objects(buf)
-        };
-        for object in objects {
-            if !response && is_request(&object) {
-                let flow = self.flows.get_mut(&key).expect("flow was just inserted");
-                let thread = flow
-                    .pending_thread
-                    .take()
-                    .or_else(|| thread_key_from_body(&object));
-                flow.requests.push(CapturedRequest {
-                    body: object,
-                    thread,
-                    user_agent: flow.pending_user_agent.take(),
-                });
-                if flow.requests.len() > 20 {
-                    flow.requests.remove(0);
-                }
-            } else if response {
+        let flow = self
+            .flows
+            .get_mut(&key)
+            .expect("resolve_direction only returns a direction for an admitted flow");
+        if direction == Dir::Response {
+            flow.response_buf.push_str(&packet.payload);
+            flow.response_buf.push('\n');
+            for object in extract_objects(&mut flow.response_buf) {
                 self.response(&key, object);
+            }
+            return;
+        }
+        // The start of an HTTP request carries its headers. A declared
+        // session/conversation id is kept until the body object is parsed,
+        // so it can be attached to that request.
+        if framed == Some(Dir::Request) {
+            flow.pending_thread = thread_key_from_headers(&packet.payload);
+            flow.pending_user_agent = user_agent_from_headers(&packet.payload);
+        }
+        flow.request_buf.push_str(&packet.payload);
+        flow.request_buf.push('\n');
+        for object in extract_objects(&mut flow.request_buf) {
+            if is_request(&object) {
+                flow.capture_request(object);
             }
         }
     }

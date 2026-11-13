@@ -1,14 +1,16 @@
 mod capture;
+mod flow;
 mod json;
 mod text;
 mod wire;
 
+use crate::flow::Flow;
+use serde_json::Value;
 use crate::wire::{
     classify, detect_backend, Dir, extract_objects, framed_direction, is_llm_response, is_request,
     looks_like_llm, Packet, parse_header, thread_key_from_body, thread_key_from_headers,
     user_agent_from_headers,
 };
-use serde_json::Value;
 use crate::text::{
     compact_arguments, first_chars, format_duration, last_chars, middle_elide, safe_name,
 };
@@ -51,45 +53,6 @@ const MAX_FLOWS: usize = 2000;
 /// on the wire yet but the harness is still in use.
 const LIVE_GRACE: Duration = Duration::from_secs(30);
 
-#[derive(Default)]
-struct Flow {
-    request_buf: String,
-    response_buf: String,
-    requests: Vec<CapturedRequest>,
-    /// Thread key parsed from the current HTTP request's headers, waiting to
-    /// be attached to the body object once it is complete.
-    pending_thread: Option<String>,
-    /// User-Agent of the current HTTP request, waiting to be attached to the
-    /// body object once it is complete.
-    pending_user_agent: Option<String>,
-    server: Option<String>,
-}
-/// Captured requests kept per flow; the oldest is dropped first.
-const MAX_CAPTURED_REQUESTS: usize = 20;
-impl Flow {
-    fn capture_request(&mut self, body: Value) {
-        let thread = self
-            .pending_thread
-            .take()
-            .or_else(|| thread_key_from_body(&body));
-        self.requests.push(CapturedRequest {
-            body,
-            thread,
-            user_agent: self.pending_user_agent.take(),
-        });
-        if self.requests.len() > MAX_CAPTURED_REQUESTS {
-            self.requests.remove(0);
-        }
-    }
-}
-/// A captured request body plus the explicit thread identity it declared, if
-/// any (headers or body fields).
-#[derive(Clone)]
-struct CapturedRequest {
-    body: Value,
-    thread: Option<String>,
-    user_agent: Option<String>,
-}
 #[derive(Default)]
 struct ToolCall {
     id: String,

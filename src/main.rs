@@ -1039,26 +1039,32 @@ impl App {
             };
     }
     fn rename_commit(&mut self) {
-        let buf = self.rename.take().unwrap_or_default();
-        let name = buf.trim().to_string();
-        if name.is_empty() {
-            if let Some(c) = self.chats.get_mut(self.selected) {
-                c.name = None;
-                self.status = "name cleared".into();
-            } else {
-                self.status = "no chat to rename".into();
-            }
-            return;
-        }
-        if let Some(c) = self.chats.get_mut(self.selected) {
-            c.name = Some(name.clone());
-            self.status = format!("renamed → {name}");
-        } else {
+        let name = self.rename.take().unwrap_or_default().trim().to_string();
+        let Some(c) = self.chats.get_mut(self.selected) else {
             self.status = "no chat to rename".into();
+            return;
+        };
+        if name.is_empty() {
+            c.name = None;
+            self.status = "name cleared".into();
+        } else {
+            self.status = format!("renamed → {name}");
+            c.name = Some(name);
         }
     }
+    /// The namer thread answered for the chat it was started on.
+    fn apply_name_result(&mut self, (id, result): NameResult) {
+        self.status = match (result, self.index_of(&id)) {
+            (Err(e), _) => format!("ai-name failed: {e}"),
+            (Ok(_), None) => "ai-name: chat no longer open".into(),
+            (Ok(name), Some(index)) => {
+                let status = format!("named → {name}");
+                self.chats[index].name = Some(name);
+                status
+            }
+        };
+    }
 }
-
 fn parse_header(s: &str) -> Option<(&str, &str)> {
     let mut p = s.split_whitespace();
     (p.next()? == "T").then_some(())?;
@@ -2646,6 +2652,31 @@ fn main() -> ExitCode {
     }
 }
 
+/// What `--dry-run` shows: the capture that would start, without starting it.
+fn print_capture_plan(interfaces: &[String], elevation: &Elevation, elevate: bool) {
+    let helper = env::var("NGREP").unwrap_or_else(|_| "ngrep".into());
+    println!("sniff-llms capture plan");
+    println!("  interfaces: {}", interfaces.join(", "));
+    println!(
+        "  capture:    {}",
+        resolve_binary(&helper)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| format!("{helper} (not found)"))
+    );
+    println!(
+        "  elevation:  {}",
+        if elevate {
+            elevation.describe()
+        } else {
+            "none (--no-elevate)".into()
+        }
+    );
+}
+/// How often the capture processes are checked for an early death.
+const REAP_INTERVAL: Duration = Duration::from_secs(2);
+/// How long the loop waits for input before redrawing.
+const REDRAW_TICK: Duration = Duration::from_millis(33);
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = env::args().collect::<Vec<_>>();
     if args.iter().any(|a| a == "-h" || a == "--help") {
@@ -2665,23 +2696,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let elevation = choose_elevation();
     let elevate = !args.iter().any(|a| a == "--no-elevate");
     if args.iter().any(|a| a == "--dry-run") {
-        let helper = env::var("NGREP").unwrap_or_else(|_| "ngrep".into());
-        println!("sniff-llms capture plan");
-        println!("  interfaces: {}", interfaces.join(", "));
-        println!(
-            "  capture:    {}",
-            resolve_binary(&helper)
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| format!("{helper} (not found)"))
-        );
-        println!(
-            "  elevation:  {}",
-            if elevate {
-                elevation.describe()
-            } else {
-                "none (--no-elevate)".into()
-            }
-        );
+        print_capture_plan(&interfaces, &elevation, elevate);
         return Ok(());
     }
     let (mut captures, rx, err_rx) = start_capture(&interfaces, &elevation, elevate)?;
@@ -2696,7 +2711,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         while let Ok(p) = rx.try_recv() {
             app.packet(p)
         }
-        if last_reap.elapsed() >= Duration::from_secs(2) {
+        if last_reap.elapsed() >= REAP_INTERVAL {
             last_reap = Instant::now();
             let (running, detail) = reap(&mut captures, &err_rx);
             if running == 0 {
@@ -2708,21 +2723,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 };
             }
         }
-        while let Ok((id, res)) = name_rx.try_recv() {
-            match res {
-                Ok(name) => {
-                    if let Some(index) = app.index_of(&id) {
-                        app.chats[index].name = Some(name.clone());
-                        app.status = format!("named → {name}");
-                    } else {
-                        app.status = "ai-name: chat no longer open".into();
-                    }
-                }
-                Err(e) => app.status = format!("ai-name failed: {e}"),
-            }
+        while let Ok(named) = name_rx.try_recv() {
+            app.apply_name_result(named);
         }
         terminal.draw(|f| draw(f, &mut app))?;
-        if !event::poll(Duration::from_millis(33))? {
+        if !event::poll(REDRAW_TICK)? {
             continue;
         }
         if !handle_event(&mut app, event::read()?, &name_tx) {

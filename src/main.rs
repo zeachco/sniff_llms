@@ -1610,20 +1610,33 @@ fn tool_calls_text(turn: &Turn) -> String {
     out.trim_end().to_string()
 }
 
+#[derive(Clone, Copy)]
+enum Section {
+    Turn,
+    Request,
+    Reasoning,
+    Answer,
+    ToolCalls,
+}
 /// The sections of one turn, in display order. The single source of the dump
 /// and body layout: render_chat, render_body and the anchor math in
 /// segment_anchor_rows all consume this, so the layout can only change here.
-fn turn_sections(c: &Chat, index: usize) -> Vec<(String, String)> {
+fn turn_sections(c: &Chat, index: usize) -> Vec<(Section, String, String)> {
     let turn = &c.turns[index];
     let mut sections = Vec::new();
     if c.turns.len() > 1 {
-        sections.push((format!("=== TURN {} ===", index + 1), String::new()));
+        let header = format!("=== TURN {} ===", index + 1);
+        sections.push((Section::Turn, header, String::new()));
     }
-    sections.push(("=== REQUEST ===".into(), turn_request_text(&c.turns, index)));
-    sections.push(("=== REASONING ===".into(), turn.reasoning.clone()));
-    sections.push(("=== ANSWER ===".into(), turn.answer.clone()));
+    let request = turn_request_text(&c.turns, index);
+    sections.push((Section::Request, "=== REQUEST ===".into(), request));
+    let reasoning = turn.reasoning.clone();
+    sections.push((Section::Reasoning, "=== REASONING ===".into(), reasoning));
+    let answer = turn.answer.clone();
+    sections.push((Section::Answer, "=== ANSWER ===".into(), answer));
     if !turn.tool_calls.is_empty() {
-        sections.push(("=== TOOL CALLS ===".into(), tool_calls_text(turn)));
+        let calls = tool_calls_text(turn);
+        sections.push((Section::ToolCalls, "=== TOOL CALLS ===".into(), calls));
     }
     sections
 }
@@ -1631,7 +1644,7 @@ fn turn_sections(c: &Chat, index: usize) -> Vec<(String, String)> {
 fn render_chat(c: &Chat) -> String {
     let mut out = format!("{}\n\n", stats_text(c));
     for index in 0..c.turns.len() {
-        for (header, text) in turn_sections(c, index) {
+        for (_, header, text) in turn_sections(c, index) {
             // Same line layout as body_section: header, text lines, blank.
             out.push_str(&header);
             out.push('\n');
@@ -1662,11 +1675,11 @@ fn render_body(c: &Chat) -> Text<'static> {
     let orange = Style::default().fg(TOOL_ORANGE);
     let cyan = Style::default().fg(Color::Cyan);
     for index in 0..c.turns.len() {
-        for (header, text) in turn_sections(c, index) {
-            let style = match header.as_str() {
-                "=== TOOL CALLS ===" => orange,
-                h if h.starts_with("=== TURN ") => cyan,
-                _ => default,
+        for (section, header, text) in turn_sections(c, index) {
+            let style = match section {
+                Section::ToolCalls => orange,
+                Section::Turn => cyan,
+                Section::Request | Section::Reasoning | Section::Answer => default,
             };
             body_section(&mut out, &header, &text, style);
         }
@@ -1801,13 +1814,13 @@ fn segment_anchor_rows(c: &Chat, body: &Text<'static>, width: u16) -> Vec<usize>
         let mut reasoning_start = 0usize;
         let mut answer_start = 0usize;
         let mut tool_start = None;
-        for (header, text) in turn_sections(c, index) {
+        for (section, _, text) in turn_sections(c, index) {
             let text_start = line_idx + 1;
-            match header.as_str() {
-                "=== REASONING ===" => reasoning_start = text_start,
-                "=== ANSWER ===" => answer_start = text_start,
-                "=== TOOL CALLS ===" => tool_start = Some(text_start),
-                _ => {}
+            match section {
+                Section::Reasoning => reasoning_start = text_start,
+                Section::Answer => answer_start = text_start,
+                Section::ToolCalls => tool_start = Some(text_start),
+                Section::Turn | Section::Request => {}
             }
             line_idx += 2 + text.lines().count();
         }

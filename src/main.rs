@@ -2210,6 +2210,35 @@ impl Elevation {
     }
 }
 
+/// Group `ngrep -W byline` output into packets: a `T src -> dst` header line
+/// followed by its payload lines, with `####` between packets.
+fn frame_packets(lines: impl Iterator<Item = String>, tx: mpsc::Sender<Packet>) {
+    let mut header = String::new();
+    let mut payload = String::new();
+    for line in lines {
+        if line == "####" {
+            if !header.is_empty() {
+                let _ = tx.send(Packet {
+                    header: std::mem::take(&mut header),
+                    payload: std::mem::take(&mut payload),
+                });
+            }
+        } else if line.starts_with("T ") && line.contains(" -> ") {
+            if !header.is_empty() {
+                let _ = tx.send(Packet { header, payload });
+            }
+            header = line;
+            payload = String::new();
+        } else {
+            payload.push_str(&line);
+            payload.push('\n');
+        }
+    }
+    if !header.is_empty() {
+        let _ = tx.send(Packet { header, payload });
+    }
+}
+
 /// One `ngrep` per interface: BSD libpcap has no multi-device capture, so the
 /// loopback and LAN legs arrive as separate processes feeding one channel.
 fn spawn_ngrep(
@@ -2239,30 +2268,7 @@ fn spawn_ngrep(
     }
     let stdout = child.stdout.take().unwrap();
     thread::spawn(move || {
-        let mut header = String::new();
-        let mut payload = String::new();
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if line == "####" {
-                if !header.is_empty() {
-                    let _ = tx.send(Packet {
-                        header: std::mem::take(&mut header),
-                        payload: std::mem::take(&mut payload),
-                    });
-                }
-            } else if line.starts_with("T ") && line.contains(" -> ") {
-                if !header.is_empty() {
-                    let _ = tx.send(Packet { header, payload });
-                }
-                header = line;
-                payload = String::new();
-            } else {
-                payload.push_str(&line);
-                payload.push('\n');
-            }
-        }
-        if !header.is_empty() {
-            let _ = tx.send(Packet { header, payload });
-        }
+        frame_packets(BufReader::new(stdout).lines().map_while(Result::ok), tx)
     });
     Ok(child)
 }

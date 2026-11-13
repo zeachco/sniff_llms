@@ -1,16 +1,40 @@
 # sniff-llms
 
 Passive llama.cpp HTTP/SSE inspector using `ngrep` and ratatui. The server does
-not need to be restarted. Packet capture alone is elevated through `pkexec`.
-The dotfiles setup installs `ngrep` and provides a `sniff_llms` shell alias, so
-the inspector can be launched from any directory:
+not need to be restarted. Packet capture is the only privileged part, and the
+program arranges it itself: `pkexec` where polkit exists, `sudo` otherwise, and
+nothing at all when the account may already read the capture device (root, or
+the macOS ChmodBPF drop-in). The dotfiles setup installs `ngrep` and provides a
+`sniff_llms` shell alias, so the inspector can be launched from any directory:
 
 ```bash
-sniff_llms --interface any
+sniff_llms                    # interfaces picked for you
+sniff_llms --interface lo0    # only the local router
+sniff_llms -i en0,utun3       # LAN and VPN, one ngrep each
 ```
 
 The alias runs `cargo run --release --` against this project's manifest and
 passes through all additional arguments.
+
+## Interfaces and capture rights
+
+BSD/macOS libpcap has no `any` pseudo-device: interfaces have to be named and
+one `ngrep` runs per interface. macOS therefore defaults to `lo0` (where a local
+llama.cpp router usually lives) plus the interface carrying the default route,
+and refuses `--interface any` with the list of names the machine actually has.
+On Linux `any` still covers every leg in one capture and remains the default.
+`--dry-run` prints the interfaces, the `ngrep` that was found, and how it would
+be elevated, without starting anything; `--no-elevate` forbids `sudo`/`pkexec`
+and reports what the device said instead.
+
+Rights are read from the machine rather than assumed. On Linux capture is
+`CAP_NET_RAW`, not a uid, and can be granted invisibly to this program — `setcap`
+on the `ngrep` binary, an ambient capability in a unit — so a non-root first
+attempt is made unprivileged and only a fast death escalates. `ngrep` is
+`brew install ngrep` on macOS, `apt install ngrep` on Debian, `pacman -S ngrep`
+(Arch, `extra`); `NGREP=/path/to/ngrep` overrides the search. Helpers are
+located by absolute path before `sudo` runs, so a `secure_path` that omits the
+Homebrew bin directory does not hide `ngrep` — or the `ollama` used by `R`.
 
 Capture listens on **all local TCP ports**, not a single one. Every packet is
 then classified by its HTTP framing (status line vs request line) or, for bare

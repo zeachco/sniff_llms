@@ -382,7 +382,7 @@ impl Chat {
             .map_or(Color::Green, |s| s.kind.color())
     }
 }
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum AutoClean {
     Never,
     ToolCalls,
@@ -410,14 +410,8 @@ impl AutoClean {
         }
     }
     fn action_for(self, finish: &str) -> Option<String> {
-        let target = match self {
-            AutoClean::Never => return None,
-            AutoClean::ToolCalls => "tool_calls",
-            AutoClean::Stop => "stop",
-            AutoClean::Length => "length",
-            AutoClean::ContentFilter => "content_filter",
-        };
-        (finish == target).then(|| target.to_string())
+        let armed = !matches!(self, AutoClean::Never);
+        (armed && finish == self.label()).then(|| finish.to_string())
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -841,11 +835,7 @@ impl App {
         let Some(parent) = self.chats.iter().position(|c| c.id() == parent_id) else {
             return self.chats.len();
         };
-        let mut end = parent + 1;
-        while end < self.chats.len() && self.in_subtree(end, parent_id) {
-            end += 1;
-        }
-        end
+        self.subtree_end(parent)
     }
     fn in_subtree(&self, mut index: usize, root_id: &str) -> bool {
         for _ in 0..self.chats.len() {
@@ -897,7 +887,7 @@ impl App {
         if let Some(first) = block.first_mut() {
             first.parent = Some(parent_id.clone());
         }
-        let position = self.group_end(&parent_id).min(self.chats.len());
+        let position = self.group_end(&parent_id);
         self.chats.splice(position..position, block);
         self.selected = position;
         self.status = format!("grouped under {parent_id}");
@@ -1711,7 +1701,7 @@ fn timeline_body(c: &Chat, active: Option<usize>) -> Timeline {
             segments.push(Some(flat));
             flat += 1;
         }
-        if turns > 1 && index + 1 < turns {
+        if index + 1 < turns {
             lines.push(Line::from(Span::styled(
                 format!("  ── turn {} ──", index + 2),
                 dim,
@@ -1936,7 +1926,6 @@ fn run_namer(model: &str, prompt: &str) -> Result<String, String> {
     text.lines()
         .find(|l| !l.trim().is_empty())
         .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
         .ok_or_else(|| "empty model output".into())
 }
 
@@ -2726,10 +2715,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         while let Ok((id, res)) = name_rx.try_recv() {
             match res {
                 Ok(name) => {
-                    let name = name.trim().to_string();
-                    if name.is_empty() {
-                        app.status = "ai-name: empty result".into();
-                    } else if let Some(c) = app.chats.iter_mut().find(|c| c.id() == id) {
+                    if let Some(c) = app.chats.iter_mut().find(|c| c.id() == id) {
                         c.name = Some(name.clone());
                         app.status = format!("named → {name}");
                     } else {

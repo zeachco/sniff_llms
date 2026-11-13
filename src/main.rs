@@ -584,74 +584,13 @@ impl App {
         // mirrored on another router leg must not create a second tab or append
         // every streamed token a second time. They can still contribute the
         // client-side request metadata the owning (backend) leg lacks.
-        let index = if let Some(index) = self.chats.iter().position(|c| c.has_id(id)) {
-            if self.chats[index].flow != flow_key {
+        let index = match self.chats.iter().position(|c| c.has_id(id)) {
+            Some(index) if self.chats[index].flow != flow_key => {
                 self.adopt_mirrored(index, flow_key);
                 return;
             }
-            index
-        } else {
-            let captured = self
-                .flows
-                .get(flow_key)
-                .and_then(|f| f.requests.last())
-                .cloned();
-            let request = captured.as_ref().map(|c| c.body.clone());
-            let client = captured.as_ref().and_then(|c| c.user_agent.clone());
-            let thread = captured.and_then(|c| c.thread);
-            // A subagent generation is a separate pi process with its own
-            // session; never fold it into the parent's message history.
-            let subagent = request.as_ref().is_some_and(looks_like_subagent_request);
-            // A new response id that continues a previous session after a tool
-            // call is another turn of the same conversation: append it instead
-            // of opening a new tab.
-            let continued = if subagent {
-                None
-            } else {
-                self.continuation(flow_key, request.as_ref(), thread.as_deref())
-            };
-            if let Some(index) = continued {
-                let chat = &mut self.chats[index];
-                chat.flow = flow_key.into();
-                chat.last_activity = Instant::now();
-                chat.turns.push(Turn::new(id.into(), request));
-                self.status = format!("continued {} → {id}", chat.id());
-                index
-            } else {
-                let model = str_field(&value, "model")
-                    .or_else(|| request.as_ref().and_then(|r| str_field(r, "model")))
-                    .unwrap_or("unknown")
-                    .into();
-                let mut chat = Chat::new(
-                    id.into(),
-                    request.clone(),
-                    model,
-                    flow_key.into(),
-                    thread,
-                    client,
-                );
-                let parent = self.subagent_parent(request.as_ref());
-                let position = match parent {
-                    Some(parent_index) => {
-                        let parent_id = self.chats[parent_index].id().to_owned();
-                        chat.parent = Some(parent_id.clone());
-                        self.status = format!("grouped {id} under {parent_id}");
-                        self.group_end(&parent_id)
-                    }
-                    None => {
-                        self.status = format!("captured {id}");
-                        self.chats.len()
-                    }
-                };
-                let had_chats = !self.chats.is_empty();
-                self.chats.insert(position, chat);
-                // Keep the selection on the same chat when another one is
-                // inserted before it. Appending never moves it.
-                if had_chats && position <= self.selected {
-                    self.selected += 1;
-                }
-                position
-            }
+            Some(index) => index,
+            None => self.open_turn(flow_key, id, &value),
         };
         let chat = &mut self.chats[index];
         chat.last_activity = Instant::now();
@@ -661,21 +600,81 @@ impl App {
         if let Some(backend) = detect_backend(&value) {
             chat.backend = Some(backend.to_string());
         }
-        {
-            let turn = chat.turns.last_mut().expect("chat has a turn");
-            if !turn.apply_chunk(&value) {
-                return;
-            }
+        let turn = chat.turns.last_mut().expect("chat has a turn");
+        if !turn.apply_chunk(&value) {
+            return;
         }
-        let auto = {
-            let chat = &self.chats[index];
-            chat.finish().and_then(|f| self.auto_clean.action_for(f))
-        };
+        let auto = self.chats[index]
+            .finish()
+            .and_then(|f| self.auto_clean.action_for(f));
         if let Some(reason) = auto {
             let id = self.chats[index].id().to_owned();
             self.close_at(index);
             self.status = format!("auto-cleaned {id} ({reason})");
         }
+    }
+    /// A response id seen for the first time starts a turn: the next one of the
+    /// chat it continues, or the first of a new chat. Returns the chat's index.
+    fn open_turn(&mut self, flow_key: &str, id: &str, value: &Value) -> usize {
+        let captured = self
+            .flows
+            .get(flow_key)
+            .and_then(|f| f.requests.last())
+            .cloned();
+        let (request, thread, client) = match captured {
+            Some(c) => (Some(c.body), c.thread, c.user_agent),
+            None => (None, None, None),
+        };
+        // A subagent generation is a separate pi process with its own
+        // session; never fold it into the parent's message history.
+        let subagent = request.as_ref().is_some_and(looks_like_subagent_request);
+        // A new response id that continues a previous session after a tool
+        // call is another turn of the same conversation: append it instead
+        // of opening a new tab.
+        let continued = if subagent {
+            None
+        } else {
+            self.continuation(flow_key, request.as_ref(), thread.as_deref())
+        };
+        if let Some(index) = continued {
+            let chat = &mut self.chats[index];
+            chat.flow = flow_key.into();
+            chat.last_activity = Instant::now();
+            chat.turns.push(Turn::new(id.into(), request));
+            self.status = format!("continued {} → {id}", chat.id());
+            return index;
+        }
+        let model = str_field(value, "model")
+            .or_else(|| request.as_ref().and_then(|r| str_field(r, "model")))
+            .unwrap_or("unknown")
+            .into();
+        let parent = self.subagent_parent(request.as_ref());
+        let chat = Chat::new(id.into(), request, model, flow_key.into(), thread, client);
+        self.place_chat(chat, parent)
+    }
+    /// Insert a new chat at the end of its parent's group, or as the last tab.
+    fn place_chat(&mut self, mut chat: Chat, parent: Option<usize>) -> usize {
+        let id = chat.id().to_owned();
+        let position = match parent {
+            Some(parent_index) => {
+                let parent_id = self.chats[parent_index].id().to_owned();
+                chat.parent = Some(parent_id.clone());
+                self.status = format!("grouped {id} under {parent_id}");
+                self.group_end(&parent_id)
+            }
+            None => {
+                self.status = format!("captured {id}");
+                self.chats.len()
+            }
+        };
+        let had_chats = !self.chats.is_empty();
+        self.chats.insert(position, chat);
+        // Keep the selection on the same chat when another one is
+        // inserted before it. Appending never moves it.
+        if had_chats && position <= self.selected {
+            self.selected += 1;
+        }
+        position
     }
     /// Find the chat a new response belongs to. A declared thread id is
     /// authoritative. Otherwise the strongest signal is the tool-call id: the

@@ -1,6 +1,7 @@
 use crate::chat::Chat;
 use crate::chat::turn::SegKind;
 use crate::flow::CapturedRequest;
+use crate::transcript::{render_chat, stats_text, tool_calls_text};
 use crate::ui::TOOL_ORANGE;
 use serde_json::json;
 use crate::wire::{

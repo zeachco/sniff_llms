@@ -12,7 +12,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Paragraph, Wrap},
 };
 use serde_json::Value;
 use std::{
@@ -1744,6 +1744,14 @@ fn timeline_body(c: &Chat, active: Option<usize>) -> Timeline {
     }
 }
 
+/// Display rows a logical line takes in an area `width` columns wide: it wraps
+/// to ceil(its width / area width) rows, and an empty line still takes one.
+/// The scroll range and the timeline anchors both count rows with this, so
+/// they cannot disagree.
+fn wrapped_rows(line: &Line, width: usize) -> usize {
+    line.width().div_ceil(width.max(1)).max(1)
+}
+
 /// Number of newlines in the first `chars` characters of `text`.
 fn newlines_before(text: &str, chars: usize) -> usize {
     text.chars().take(chars).filter(|&c| c == '\n').count()
@@ -1777,14 +1785,12 @@ fn tool_call_line_starts(turn: &Turn) -> Vec<usize> {
 // (`unwrap_or(row)`, `unwrap_or(0)`) tolerate lines appended after the map
 // was built and out-of-range segments instead of panicking.
 fn segment_anchor_rows(c: &Chat, body: &Text<'static>, width: u16) -> Vec<usize> {
-    let width = width.max(1) as usize;
-    // Display row at which each logical line of the body starts. A logical
-    // line wraps to ceil(its width / area width) display rows.
+    // Display row at which each logical line of the body starts.
     let mut line_rows: Vec<usize> = Vec::with_capacity(body.lines.len());
     let mut row = 0usize;
     for line in &body.lines {
         line_rows.push(row);
-        row += line.width().div_ceil(width).max(1);
+        row += wrapped_rows(line, width as usize);
     }
     let mut out: Vec<usize> = Vec::new();
     for (index, turn) in c.turns.iter().enumerate() {
@@ -2362,8 +2368,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     };
     frame.render_widget(
         Paragraph::new(tab_line).block(
-            Block::default()
-                .borders(Borders::ALL)
+            Block::bordered()
                 .title(" llama.cpp conversations "),
         ),
         areas[0],
@@ -2392,7 +2397,7 @@ fn render_chat_panes(frame: &mut ratatui::Frame, app: &mut App, content: &[Rect]
             .constraints([Constraint::Length(stats_height), Constraint::Min(1)])
             .split(content[1]);
         frame.render_widget(
-            Paragraph::new(stats).block(Block::default().borders(Borders::ALL).title(" stats ")),
+            Paragraph::new(stats).block(Block::bordered().title(" stats ")),
             details[0],
         );
         let body = render_body(c);
@@ -2403,7 +2408,7 @@ fn render_chat_panes(frame: &mut ratatui::Frame, app: &mut App, content: &[Rect]
         let body_rows = body
             .lines
             .iter()
-            .map(|line| line.width().div_ceil(inner_width.max(1)).max(1))
+            .map(|line| wrapped_rows(line, inner_width))
             .sum::<usize>();
         let max = body_rows.saturating_sub(visible).min(u16::MAX as usize) as u16;
         if c.follow {
@@ -2418,12 +2423,12 @@ fn render_chat_panes(frame: &mut ratatui::Frame, app: &mut App, content: &[Rect]
         let segment_rows = timeline.segments;
         frame.render_widget(
             Paragraph::new(timeline.text)
-                .block(Block::default().borders(Borders::ALL).title(" timeline ")),
+                .block(Block::bordered().title(" timeline ")),
             content[0],
         );
         frame.render_widget(
             Paragraph::new(body)
-                .block(Block::default().borders(Borders::ALL).title(format!(
+                .block(Block::bordered().title(format!(
                     " {} | {} chunks | {} ",
                     c.model,
                     c.chunks(),
@@ -2445,12 +2450,12 @@ fn render_chat_panes(frame: &mut ratatui::Frame, app: &mut App, content: &[Rect]
         app.body_anchors.clear();
         frame.render_widget(
             Paragraph::new("(no chat)")
-                .block(Block::default().borders(Borders::ALL).title(" timeline ")),
+                .block(Block::bordered().title(" timeline ")),
             content[0],
         );
         frame.render_widget(
             Paragraph::new("No conversations captured yet.")
-                .block(Block::default().borders(Borders::ALL)),
+                .block(Block::bordered()),
             content[1],
         );
     }

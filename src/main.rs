@@ -836,8 +836,12 @@ impl App {
         best.map(|(_, index)| index)
     }
     /// Insertion point just after a chat and its already grouped descendants.
+    /// Index of the chat whose first turn has this id.
+    fn index_of(&self, id: &str) -> Option<usize> {
+        self.chats.iter().position(|c| c.id() == id)
+    }
     fn group_end(&self, parent_id: &str) -> usize {
-        let Some(parent) = self.chats.iter().position(|c| c.id() == parent_id) else {
+        let Some(parent) = self.index_of(parent_id) else {
             return self.chats.len();
         };
         self.subtree_end(parent)
@@ -850,7 +854,7 @@ impl App {
             if parent == root_id {
                 return true;
             }
-            let Some(next) = self.chats.iter().position(|c| c.id() == parent) else {
+            let Some(next) = self.index_of(parent) else {
                 return false;
             };
             index = next;
@@ -878,7 +882,7 @@ impl App {
             self.status = "group mark cleared".into();
             return;
         }
-        let Some(parent_index) = self.chats.iter().position(|c| c.id() == parent_id) else {
+        let Some(parent_index) = self.index_of(&parent_id) else {
             self.status = "group parent tab was closed".into();
             return;
         };
@@ -2710,8 +2714,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         while let Ok((id, res)) = name_rx.try_recv() {
             match res {
                 Ok(name) => {
-                    if let Some(c) = app.chats.iter_mut().find(|c| c.id() == id) {
-                        c.name = Some(name.clone());
+                    if let Some(index) = app.index_of(&id) {
+                        app.chats[index].name = Some(name.clone());
                         app.status = format!("named → {name}");
                     } else {
                         app.status = "ai-name: chat no longer open".into();

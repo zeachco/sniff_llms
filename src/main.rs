@@ -212,6 +212,10 @@ impl Turn {
         }
     }
 
+    /// The messages of the request that produced this turn, if it was captured.
+    fn messages(&self) -> Option<&[Value]> {
+        self.request.as_ref().and_then(request_messages)
+    }
     /// Apply one streamed response chunk to this turn. Returns false when the
     /// chunk carries no `choices[0]` — usage/timings still count, nothing else
     /// does. (Mirrors the early return the caller used to make inline.)
@@ -235,10 +239,7 @@ impl Turn {
             self.answer.push_str(s);
             self.push(SegKind::Answer, s);
         }
-        if let Some(calls) = delta
-            .and_then(|v| v.get("tool_calls"))
-            .and_then(Value::as_array)
-        {
+        if let Some(calls) = delta.and_then(tool_calls_of) {
             for (pos, call) in calls.iter().enumerate() {
                 // Tool-call arguments stream as many small deltas; concatenate them
                 // per call (keyed by the delta `index`) instead of one line each.
@@ -378,9 +379,7 @@ impl Chat {
         }
         let resolved: HashSet<&str> = self
             .last()
-            .request
-            .as_ref()
-            .and_then(request_messages)
+            .messages()
             .into_iter()
             .flatten()
             .filter(|m| str_field(m, "role") == Some("tool"))
@@ -704,7 +703,7 @@ impl App {
         let new_msgs = request_messages(request)?;
         let request_ids: HashSet<&str> = new_msgs
             .iter()
-            .filter_map(|m| m.get("tool_calls").and_then(Value::as_array))
+            .filter_map(tool_calls_of)
             .flatten()
             .filter_map(|call| str_field(call, "id"))
             .collect();
@@ -736,9 +735,7 @@ impl App {
                 .collect();
             let id_matches = tool_ids.intersection(&request_ids).count();
             let prefix_len = turn
-                .request
-                .as_ref()
-                .and_then(request_messages)
+                .messages()
                 .filter(|prev| {
                     !prev.is_empty()
                         && new_msgs.len() > prev.len()
@@ -1067,6 +1064,10 @@ fn str_or<'a>(v: &'a Value, key: &str, default: &'a str) -> &'a str {
 fn request_messages<'a>(v: &'a Value) -> Option<&'a [Value]> {
     v.get("messages").and_then(Value::as_array).map(Vec::as_slice)
 }
+/// The `tool_calls` array of a message or a streamed delta.
+fn tool_calls_of(v: &Value) -> Option<&[Value]> {
+    v.get("tool_calls").and_then(Value::as_array).map(Vec::as_slice)
+}
 
 fn text_of(v: &Value, pretty: bool) -> String {
     match v {
@@ -1379,11 +1380,14 @@ fn compact_arguments(raw: &str) -> String {
     }
 }
 
-fn number_at<'a>(value: Option<&'a Value>, keys: &[&str]) -> Option<&'a Value> {
-    let value = value?;
+fn number_at<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
     keys.iter()
         .find_map(|key| value.get(*key))
         .filter(|v| v.is_number())
+}
+/// A stat that may be missing from the server's report.
+fn shown(number: Option<&Value>) -> String {
+    number.map_or("?".into(), Value::to_string)
 }
 
 fn stats_text(c: &Chat) -> String {
@@ -1420,29 +1424,26 @@ fn stats_text(c: &Chat) -> String {
         stats.push(format!("Tool calls: {tool_count}"));
     }
     if let Some(usage) = c.usage() {
-        let prompt = number_at(Some(usage), &["prompt_tokens"]);
-        let completion = number_at(Some(usage), &["completion_tokens"]);
-        let total = number_at(Some(usage), &["total_tokens"]);
+        let prompt = number_at(usage, &["prompt_tokens"]);
+        let completion = number_at(usage, &["completion_tokens"]);
+        let total = number_at(usage, &["total_tokens"]);
         if prompt.is_some() || completion.is_some() || total.is_some() {
             stats.push(format!(
                 "Tokens: prompt {} | completion {} | total {}",
-                prompt.map_or("?".into(), Value::to_string),
-                completion.map_or("?".into(), Value::to_string),
-                total.map_or("?".into(), Value::to_string),
+                shown(prompt),
+                shown(completion),
+                shown(total),
             ));
         }
     }
     if let Some(timings) = c.timings() {
-        let predicted = number_at(
-            Some(timings),
-            &["predicted_per_second", "tokens_per_second"],
-        );
-        let prompt = number_at(Some(timings), &["prompt_per_second"]);
+        let predicted = number_at(timings, &["predicted_per_second", "tokens_per_second"]);
+        let prompt = number_at(timings, &["prompt_per_second"]);
         if predicted.is_some() || prompt.is_some() {
             stats.push(format!(
                 "Speed: generation {} tok/s | prompt {} tok/s",
-                predicted.map_or("?".into(), Value::to_string),
-                prompt.map_or("?".into(), Value::to_string),
+                shown(predicted),
+                shown(prompt),
             ));
         }
     }
@@ -1508,7 +1509,7 @@ fn messages_text(messages: &[Value], skip: usize) -> String {
         let role = str_or(m, "role", "unknown");
         let content = m.get("content").map(|v| text_of(v, true)).unwrap_or_default();
         out.push_str(&format!("[{role}]\n{content}\n"));
-        if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
+        if let Some(calls) = tool_calls_of(m) {
             for call in calls {
                 let name = call
                     .pointer("/function/name")
@@ -1888,15 +1889,10 @@ fn name_prompt(c: &Chat) -> String {
     let first_user = c
         .turns
         .first()
-        .and_then(|t| t.request.as_ref())
-        .and_then(request_messages)
-        .and_then(|m| {
-            m.iter()
-                .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-                .and_then(|m| m.get("content").and_then(Value::as_str))
-                .map(str::to_owned)
-        })
-        .map(|s| first_chars(&s, 100))
+        .and_then(Turn::messages)
+        .and_then(|m| m.iter().find(|m| str_field(m, "role") == Some("user")))
+        .and_then(|m| str_field(m, "content"))
+        .map(|s| first_chars(s, 100))
         .unwrap_or_default();
     let tail = last_chars(&c.last().answer, 1000);
     format!(

@@ -452,6 +452,14 @@ const TOOL_ORANGE: Color = Color::Rgb(255, 165, 0);
 /// much stronger signal than the profile prompt or the timing-only fallback,
 /// so it dominates: any brief match outranks any combination without one.
 const BRIEF_MATCH_WEIGHT: usize = 10;
+/// A parent that has been silent this long is no longer waiting on a subagent.
+const SUBAGENT_WINDOW: Duration = Duration::from_secs(300);
+/// Shorter strings in tool-call arguments are too generic to identify a brief.
+const MIN_BRIEF_CHARS: usize = 40;
+/// How much of a brief's opening is searched for in the child request.
+const BRIEF_NEEDLE_CHARS: usize = 80;
+/// Bytes of request text scanned for a brief; huge histories stop here.
+const REQUEST_TEXT_SCAN_CAP: usize = 256 * 1024;
 struct App {
     flows: HashMap<String, Flow>,
     chats: Vec<Chat>,
@@ -823,13 +831,13 @@ impl App {
             if calls.is_empty() {
                 continue;
             }
-            if chat.last_activity.elapsed() > Duration::from_secs(300) {
+            if chat.last_activity.elapsed() > SUBAGENT_WINDOW {
                 continue;
             }
             let brief_match = calls.iter().any(|call| {
                 briefs(&call.arguments).iter().any(|brief| {
-                    let needle = first_chars(brief, 80);
-                    needle.chars().count() >= 40 && plain.contains(&needle)
+                    let needle = first_chars(brief, BRIEF_NEEDLE_CHARS);
+                    needle.chars().count() >= MIN_BRIEF_CHARS && plain.contains(&needle)
                 })
             });
             if request.is_some() && !profile && !brief_match {
@@ -1274,7 +1282,7 @@ fn request_plain_text(request: &Value) -> String {
             out.push_str(&text_of(content, false));
         }
         out.push('\n');
-        if out.len() > 256 * 1024 {
+        if out.len() > REQUEST_TEXT_SCAN_CAP {
             break;
         }
     }
@@ -1287,7 +1295,7 @@ fn request_plain_text(request: &Value) -> String {
 fn briefs(arguments: &str) -> Vec<String> {
     fn walk(value: &Value, out: &mut Vec<String>) {
         match value {
-            Value::String(s) if s.chars().count() >= 40 => out.push(s.clone()),
+            Value::String(s) if s.chars().count() >= MIN_BRIEF_CHARS => out.push(s.clone()),
             Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
             Value::Object(map) => map.values().for_each(|item| walk(item, out)),
             _ => {}
@@ -1477,8 +1485,9 @@ fn stats_text(c: &Chat) -> String {
 // Why hand-rolled: streamed SSE chunks split JSON objects across packet
 // boundaries, so serde_json's StreamDeserializer cannot be used incrementally
 // here — objects are only complete once brace depth returns to zero inside
-// this growing buffer. The 4096-char tail cap keeps a long non-JSON prefix
-// from growing the buffer without bound.
+// this growing buffer. The tail cap keeps a long non-JSON prefix from growing
+// the buffer without bound.
+const NON_JSON_TAIL_CHARS: usize = 4096;
 fn extract_objects(buffer: &mut String) -> Vec<Value> {
     let mut out = vec![];
     let mut start = None;
@@ -1523,7 +1532,7 @@ fn extract_objects(buffer: &mut String) -> Vec<Value> {
     *buffer = if let Some(i) = start {
         buffer[i..].to_owned()
     } else {
-        last_chars(&buffer[consumed..], 4096)
+        last_chars(&buffer[consumed..], NON_JSON_TAIL_CHARS)
     };
     out
 }
@@ -1930,6 +1939,9 @@ fn last_chars(s: &str, n: usize) -> String {
 }
 /// A chat id and the name the namer produced for it, or why it failed.
 type NameResult = (String, Result<String, String>);
+/// How much of the conversation's two ends the namer gets to read.
+const NAME_HEAD_CHARS: usize = 100;
+const NAME_TAIL_CHARS: usize = 1000;
 fn name_prompt(c: &Chat) -> String {
     let first_user = c
         .turns
@@ -1937,11 +1949,11 @@ fn name_prompt(c: &Chat) -> String {
         .and_then(Turn::messages)
         .and_then(|m| m.iter().find(|m| str_field(m, "role") == Some("user")))
         .and_then(|m| str_field(m, "content"))
-        .map(|s| first_chars(s, 100))
+        .map(|s| first_chars(s, NAME_HEAD_CHARS))
         .unwrap_or_default();
-    let tail = last_chars(&c.last().answer, 1000);
+    let tail = last_chars(&c.last().answer, NAME_TAIL_CHARS);
     format!(
-        "Name this chat conversation in 2-6 words. Reply with ONLY the name, no quotes, no trailing punctuation.\n\nFirst user message (first 100 chars):\n{first_user}\n\nEnd of conversation (last 1000 chars):\n{tail}"
+        "Name this chat conversation in 2-6 words. Reply with ONLY the name, no quotes, no trailing punctuation.\n\nFirst user message (first {NAME_HEAD_CHARS} chars):\n{first_user}\n\nEnd of conversation (last {NAME_TAIL_CHARS} chars):\n{tail}"
     )
 }
 fn run_namer(model: &str, prompt: &str) -> Result<String, String> {
@@ -2348,6 +2360,10 @@ fn reap(captures: &mut [Child], errors: &Receiver<String>) -> (usize, String) {
     (running, detail)
 }
 
+/// Columns (or rows) a bordered block spends on its two borders.
+const BORDER_CELLS: u16 = 2;
+const TAB_LABEL_MAX_CHARS: usize = 22;
+
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
@@ -2368,7 +2384,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 let label = c.name.clone().unwrap_or_else(|| c.id().to_owned());
                 let prefix = if c.parent.is_some() { "↳ " } else { "" };
                 (
-                    format!(" {prefix}{} {} ", middle_elide(&label, 22), marker),
+                    format!(" {prefix}{} {} ", middle_elide(&label, TAB_LABEL_MAX_CHARS), marker),
                     Style::default().fg(c.state_color()),
                 )
             })
@@ -2376,7 +2392,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         build_tab_line(
             &items,
             app.selected,
-            areas[0].width.saturating_sub(2) as usize,
+            areas[0].width.saturating_sub(BORDER_CELLS) as usize,
         )
     };
     frame.render_widget(
@@ -2403,7 +2419,7 @@ fn render_chat_panes(frame: &mut ratatui::Frame, app: &mut App, content: &[Rect]
         let stats_height = stats
             .lines()
             .count()
-            .saturating_add(2)
+            .saturating_add(BORDER_CELLS as usize)
             .min(u16::MAX as usize) as u16;
         let details = Layout::default()
             .direction(Direction::Vertical)
@@ -2414,8 +2430,8 @@ fn render_chat_panes(frame: &mut ratatui::Frame, app: &mut App, content: &[Rect]
             details[0],
         );
         let body = render_body(c);
-        let inner_width = details[1].width.saturating_sub(2) as usize;
-        let visible = details[1].height.saturating_sub(2) as usize;
+        let inner_width = details[1].width.saturating_sub(BORDER_CELLS) as usize;
+        let visible = details[1].height.saturating_sub(BORDER_CELLS) as usize;
         // The body wraps at its inner width, so the scroll range must be
         // measured in wrapped display rows, not logical lines.
         let body_rows = body

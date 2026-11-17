@@ -11,11 +11,14 @@ use crate::text::middle_elide;
 use crate::transcript::stats_text;
 use crate::ui::body::{render_body, segment_anchor_rows, wrapped_rows};
 use crate::ui::tab_bar::build_tab_line;
-use crate::ui::timeline::timeline_body;
+use crate::ui::timeline::{keep_row_visible, timeline_body};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph, Wrap};
+
+/// The keymap shown by the `?` panel; one wrap-friendly line.
+const HELP_TEXT: &str = " ←/→ chat · n next running · ↑/↓ scroll · PgUp/PgDn page · Home top · End follow · wheel body or timeline · click a tab or timeline row · x close · X clean finished · m merge into left · g group · u ungroup · t requests on/off · d dump · a auto-clean · r rename · R ai-name · ? help · q quit ";
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 
@@ -47,15 +50,17 @@ const BORDER_CELLS: u16 = 2;
 const TAB_LABEL_MAX_CHARS: usize = 22;
 
 pub(crate) fn draw(frame: &mut ratatui::Frame, app: &mut App) {
+    // The keymap panel takes the bottom three rows while it is open; the
+    // status message has the whole row otherwise.
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(if app.help { 3 } else { 1 }),
         ])
         .split(frame.area());
-    let tab_line = {
+    let (tab_line, tab_hits) = {
         let items: Vec<(String, Style)> = app
             .chats
             .iter()
@@ -77,11 +82,22 @@ pub(crate) fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             areas[0].width.saturating_sub(BORDER_CELLS) as usize,
         )
     };
+    app.tab_area = areas[0];
+    app.tab_hits = tab_hits
+        .into_iter()
+        .map(|(start, end, index)| {
+            // The line renders inside the block border.
+            (start as u16 + areas[0].x + 1, end as u16 + areas[0].x + 1, index)
+        })
+        .collect();
+    let running = app.chats.iter().filter(|c| c.is_running()).count();
+    let title = if running > 0 {
+        format!(" llama.cpp conversations · {running} running ")
+    } else {
+        " llama.cpp conversations ".to_string()
+    };
     frame.render_widget(
-        Paragraph::new(tab_line).block(
-            Block::bordered()
-                .title(" llama.cpp conversations "),
-        ),
+        Paragraph::new(tab_line).block(Block::bordered().title(title)),
         areas[0],
     );
     let timeline_width = (areas[1].width / 3).clamp(24, 36);
@@ -90,7 +106,13 @@ pub(crate) fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         .constraints([Constraint::Length(timeline_width), Constraint::Min(1)])
         .split(areas[1]);
     render_chat_panes(frame, app, &content);
-    frame.render_widget(Paragraph::new(status_bar(app)), areas[2]);
+    let status = Paragraph::new(status_bar(app, areas[2].width));
+    let status = if app.help {
+        status.wrap(Wrap { trim: false })
+    } else {
+        status
+    };
+    frame.render_widget(status, areas[2]);
 }
 
 /// Render the timeline/stats/body panes for the selected chat, and record the
@@ -114,6 +136,7 @@ fn render_chat_panes(frame: &mut ratatui::Frame, app: &mut App, content: &[Rect]
         let body = render_body(c);
         let inner_width = details[1].width.saturating_sub(BORDER_CELLS) as usize;
         let visible = details[1].height.saturating_sub(BORDER_CELLS) as usize;
+        app.body_rows = visible;
         // The body wraps at its inner width, so the scroll range must be
         // measured in wrapped display rows, not logical lines.
         let body_rows = body
@@ -132,19 +155,40 @@ fn render_chat_panes(frame: &mut ratatui::Frame, app: &mut App, content: &[Rect]
         let active = anchors.iter().rposition(|&anchor| anchor <= top);
         let timeline = timeline_body(c, active);
         let segment_rows = timeline.segments;
+        // The timeline follows the active entry while the body follows the
+        // stream, so the underline never leaves the pane; wheel scrolling
+        // moves it until the next snap.
+        let tl_visible = content[0].height.saturating_sub(BORDER_CELLS) as usize;
+        let tl_max = segment_rows.len().saturating_sub(tl_visible) as u16;
+        if c.follow && let Some(row) = active {
+            c.timeline_scroll = keep_row_visible(row, tl_visible, tl_max);
+        }
+        c.timeline_scroll = c.timeline_scroll.min(tl_max);
         frame.render_widget(
             Paragraph::new(timeline.text)
-                .block(Block::bordered().title(" timeline ")),
+                .block(Block::bordered().title(" timeline "))
+                .scroll((c.timeline_scroll, 0)),
             content[0],
         );
+        // The title shows the paused state, because a scrolled-back body
+        // stops moving without any other cue.
+        let mut title = vec![Span::raw(format!(
+            " {} | {} chunks | {} ",
+            c.model,
+            c.chunks(),
+            c.finish().unwrap_or("streaming")
+        ))];
+        if !c.follow {
+            title.push(Span::styled(
+                " paused ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         frame.render_widget(
             Paragraph::new(body)
-                .block(Block::bordered().title(format!(
-                    " {} | {} chunks | {} ",
-                    c.model,
-                    c.chunks(),
-                    c.finish().unwrap_or("streaming")
-                )))
+                .block(Block::bordered().title(Line::from(title)))
                 .wrap(Wrap { trim: false })
                 .scroll((c.scroll, 0)),
             details[1],
@@ -157,6 +201,7 @@ fn render_chat_panes(frame: &mut ratatui::Frame, app: &mut App, content: &[Rect]
     } else {
         app.timeline_area = Rect::default();
         app.body_area = Rect::default();
+        app.body_rows = 0;
         app.timeline_segments.clear();
         app.body_anchors.clear();
         frame.render_widget(
@@ -172,10 +217,13 @@ fn render_chat_panes(frame: &mut ratatui::Frame, app: &mut App, content: &[Rect]
     }
 }
 
-/// The bottom status line: rename editor when active, keymap otherwise.
-fn status_bar(app: &App) -> Line<'static> {
-    match app.rename.as_ref() {
-        Some(buf) => Line::from(vec![
+/// The bottom line: the rename editor when active, the keymap while the help
+/// is open, the status message otherwise. The message gets the whole row when
+/// the help is closed, so long paths and ids are not truncated on narrow
+/// terminals; the keymap lives in the `?` panel.
+pub(crate) fn status_bar(app: &App, width: u16) -> Text<'static> {
+    if let Some(buf) = app.rename.as_ref() {
+        return Text::from(Line::from(vec![
             Span::styled(
                 " rename ",
                 Style::default()
@@ -183,40 +231,20 @@ fn status_bar(app: &App) -> Line<'static> {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(" {buf} ")),
-            Span::styled(
-                "│ Enter=save  Esc=cancel",
-                DIM,
-            ),
-        ]),
-        None => {
-            let key = |k: &'static str| Span::styled(k, Style::default().fg(Color::Cyan));
-            Line::from(vec![
-                Span::raw(format!(" {}  ", app.status)),
-                key("←/→"),
-                Span::raw(" tabs "),
-                key("↑/↓"),
-                Span::raw(" scroll "),
-                key("x"),
-                Span::raw(" close "),
-                key("X"),
-                Span::raw(" clean done "),
-                key("m"),
-                Span::raw(" merge "),
-                key("g"),
-                Span::raw(" group "),
-                key("u"),
-                Span::raw(" ungroup "),
-                key("d"),
-                Span::raw(" dump "),
-                key("a"),
-                Span::raw(format!(" auto-clean:{} ", app.auto_clean.label())),
-                key("r"),
-                Span::raw(" rename "),
-                key("R"),
-                Span::raw(" name "),
-                key("q"),
-                Span::raw(" quit"),
-            ])
-        }
+            Span::styled("│ Enter=save  Esc=cancel", DIM),
+        ]));
     }
+    if app.help {
+        return Text::from(Line::from(Span::raw(HELP_TEXT)));
+    }
+    let hint = " ? keys";
+    let status = format!(" {}", app.status);
+    let pad = width
+        .saturating_sub((status.chars().count() + hint.chars().count()) as u16);
+    let mut line = vec![Span::raw(status)];
+    if pad > 0 {
+        line.push(Span::raw(" ".repeat(pad as usize)));
+    }
+    line.push(Span::styled(hint, DIM));
+    Text::from(Line::from(line))
 }

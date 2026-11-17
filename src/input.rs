@@ -11,13 +11,28 @@ use std::sync::mpsc;
 /// Rows the body moves per mouse-wheel notch.
 const WHEEL_ROWS: u16 = 3;
 
+/// One screen minus one row, so a page up leaves the previous bottom line in
+/// view.
+fn page_size(body_rows: usize) -> u16 {
+    body_rows.saturating_sub(1).min(u16::MAX as usize) as u16
+}
+
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     let at = Position {
         x: mouse.column,
         y: mouse.row,
     };
-    let over_body = app.body_area.contains(at);
     match mouse.kind {
+        // A click on the tab bar selects that chat.
+        MouseEventKind::Down(MouseButton::Left) if app.tab_area.contains(at) => {
+            if let Some((_, _, index)) = app
+                .tab_hits
+                .iter()
+                .find(|(start, end, _)| at.x >= *start && at.x < *end)
+            {
+                app.selected = *index;
+            }
+        }
         // A click on the timeline jumps the body to that segment.
         MouseEventKind::Down(MouseButton::Left) if app.timeline_area.contains(at) => {
             let row = (mouse.row as usize).saturating_sub(app.timeline_area.y as usize + 1);
@@ -30,14 +45,25 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             }
         }
         // The wheel over the body scrolls it.
-        MouseEventKind::ScrollUp if over_body => {
+        MouseEventKind::ScrollUp if app.body_area.contains(at) => {
             if let Some(c) = app.chats.get_mut(app.selected) {
                 c.scroll_up(WHEEL_ROWS);
             }
         }
-        MouseEventKind::ScrollDown if over_body => {
+        MouseEventKind::ScrollDown if app.body_area.contains(at) => {
             if let Some(c) = app.chats.get_mut(app.selected) {
                 c.scroll_down(WHEEL_ROWS);
+            }
+        }
+        // The wheel over the timeline scrolls it.
+        MouseEventKind::ScrollUp if app.timeline_area.contains(at) => {
+            if let Some(c) = app.chats.get_mut(app.selected) {
+                c.timeline_scroll = c.timeline_scroll.saturating_sub(WHEEL_ROWS);
+            }
+        }
+        MouseEventKind::ScrollDown if app.timeline_area.contains(at) => {
+            if let Some(c) = app.chats.get_mut(app.selected) {
+                c.timeline_scroll = c.timeline_scroll.saturating_add(WHEEL_ROWS);
             }
         }
         _ => {}
@@ -117,6 +143,26 @@ pub(crate) fn handle_event(app: &mut App, event: Event, name_tx: &mpsc::Sender<N
                 c.follow = true
             }
         }
+        KeyCode::Home => {
+            if let Some(c) = app.chats.get_mut(app.selected) {
+                c.follow = false;
+                c.scroll = 0;
+            }
+        }
+        // One screen per notch, measured from the body pane's own height.
+        KeyCode::PageUp => {
+            if let Some(c) = app.chats.get_mut(app.selected) {
+                c.scroll_up(page_size(app.body_rows));
+            }
+        }
+        KeyCode::PageDown => {
+            if let Some(c) = app.chats.get_mut(app.selected) {
+                c.scroll_down(page_size(app.body_rows));
+            }
+        }
+        KeyCode::Char('?') => app.help = !app.help,
+        KeyCode::Char('n') => app.next_running(),
+        KeyCode::Char('t') => app.toggle_requests(),
         KeyCode::Char('x') => app.close(),
         KeyCode::Char('X') => app.clean_done(),
         KeyCode::Char('m') => app.merge_prev(),

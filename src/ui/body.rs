@@ -25,7 +25,7 @@ pub(crate) fn render_body(c: &Chat) -> Text<'static> {
     let orange = Style::default().fg(TOOL_ORANGE);
     let cyan = Style::default().fg(Color::Cyan);
     for index in 0..c.turns.len() {
-        for (section, header, text) in turn_sections(c, index) {
+        for (section, header, text) in turn_sections(c, index, c.show_requests) {
             let style = match section {
                 Section::ToolCalls => orange,
                 Section::Turn => cyan,
@@ -94,7 +94,8 @@ pub(crate) fn segment_anchor_rows(c: &Chat, body: &Text<'static>, width: u16) ->
         let mut reasoning_start = 0usize;
         let mut answer_start = 0usize;
         let mut tool_start = None;
-        for (section, _, text) in turn_sections(c, index) {
+        // Same flag as render_body, so the anchors track the visible rows.
+        for (section, _, text) in turn_sections(c, index, c.show_requests) {
             let text_start = line_idx + 1;
             match section {
                 Section::Reasoning => reasoning_start = text_start,

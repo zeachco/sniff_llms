@@ -1,13 +1,20 @@
-//! The tab bar: the window of tabs that fits, with overflow indicators.
+//! The tab bar: the window of tabs that fits, with overflow indicators, and
+//! the column range of each visible tab so a mouse click can select it.
 
 use crate::ui::DIM;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-pub(crate) fn build_tab_line(items: &[(String, Style)], selected: usize, available: usize) -> Line<'static> {
+/// The tab line and, per visible tab, its `(start, end)` column range within
+/// the line (content coordinates, 0-based) and its chat index.
+pub(crate) fn build_tab_line(
+    items: &[(String, Style)],
+    selected: usize,
+    available: usize,
+) -> (Line<'static>, Vec<(usize, usize, usize)>) {
     let n = items.len();
     if n == 0 {
-        return Line::from(" no chats ");
+        return (Line::from(" no chats "), vec![]);
     }
     let sep = " │ ";
     let sep_w = 3usize;
@@ -36,13 +43,16 @@ pub(crate) fn build_tab_line(items: &[(String, Style)], selected: usize, availab
         a -= 1;
     }
     let mut spans: Vec<Span> = Vec::new();
+    let mut hits: Vec<(usize, usize, usize)> = Vec::new();
+    let mut col = 0usize;
     if a > 0 {
         spans.push(Span::styled(ind_text(a), DIM));
         spans.push(Span::raw(sep));
+        col += ind_width(a) + sep_w;
     }
     let sel_text = &items[sel].0;
     let mut first = true;
-    for (text, style) in &items[a..b] {
+    for (offset, (text, style)) in items[a..b].iter().enumerate() {
         if !first {
             spans.push(Span::raw(sep));
         }
@@ -55,10 +65,12 @@ pub(crate) fn build_tab_line(items: &[(String, Style)], selected: usize, availab
             *style
         };
         spans.push(Span::styled(text.clone(), style));
+        hits.push((col, col + text.chars().count(), a + offset));
+        col += text.chars().count() + sep_w;
     }
     if b < n {
         spans.push(Span::raw(sep));
         spans.push(Span::styled(ind_text(n - b), DIM));
     }
-    Line::from(spans)
+    (Line::from(spans), hits)
 }

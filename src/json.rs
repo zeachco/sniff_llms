@@ -10,7 +10,7 @@ pub(crate) fn str_or<'a>(v: &'a Value, key: &str, default: &'a str) -> &'a str {
     str_field(v, key).unwrap_or(default)
 }
 
-pub(crate) fn request_messages<'a>(v: &'a Value) -> Option<&'a [Value]> {
+pub(crate) fn request_messages(v: &Value) -> Option<&[Value]> {
     v.get("messages").and_then(Value::as_array).map(Vec::as_slice)
 }
 

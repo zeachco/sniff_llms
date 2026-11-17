@@ -34,6 +34,14 @@ pub(crate) struct Chat {
     pub(crate) turns: Vec<Turn>,
     pub(crate) scroll: u16,
     pub(crate) follow: bool,
+    /// Display rows the user scrolled in the timeline pane. The timeline
+    /// follows the active entry while the body follows the stream; manual
+    /// wheel scrolling moves it until the next snap.
+    pub(crate) timeline_scroll: u16,
+    /// Whether the body pane shows each turn's request section. Long system
+    /// prompts bury the answer, so the user can hide them (key `t`); the
+    /// dump always keeps them.
+    pub(crate) show_requests: bool,
 }
 
 impl Chat {
@@ -57,6 +65,8 @@ impl Chat {
             turns: vec![Turn::new(id, request)],
             scroll: 0,
             follow: true,
+            timeline_scroll: 0,
+            show_requests: true,
         }
     }
     /// Scrolling back stops following the stream; scrolling forward does not

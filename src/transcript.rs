@@ -129,6 +129,28 @@ fn request_delta_text(previous: Option<&Value>, current: Option<&Value>) -> Stri
     messages_text(new, common)
 }
 
+/// How many messages the request section of turn `index` would show, or None
+/// when no request was captured for it. Mirrors the skip logic of
+/// `request_delta_text`, so the hidden-request summary counts exactly what the
+/// expanded section would render.
+fn request_message_count(turns: &[Turn], index: usize) -> Option<usize> {
+    let current = turns[index].request.as_ref().and_then(request_messages)?;
+    let common = index
+        .checked_sub(1)
+        .and_then(|previous| {
+            turns[previous].request.as_ref().and_then(request_messages)
+        })
+        .map(|previous| {
+            current
+                .iter()
+                .zip(previous)
+                .take_while(|(new, prev)| new == prev)
+                .count()
+        })
+        .unwrap_or(0);
+    Some(current.len() - common)
+}
+
 fn turn_request_text(turns: &[Turn], index: usize) -> String {
     let turn = &turns[index];
     match index.checked_sub(1) {
@@ -171,7 +193,9 @@ pub(crate) enum Section {
 /// The sections of one turn, in display order. The single source of the dump
 /// and body layout: render_chat, render_body and the anchor math in
 /// segment_anchor_rows all consume this, so the layout can only change here.
-pub(crate) fn turn_sections(c: &Chat, index: usize) -> Vec<(Section, String, String)> {
+/// `show_requests` collapses the request section to a one-line summary; the
+/// body pane passes the chat's toggle, the dump always passes true.
+pub(crate) fn turn_sections(c: &Chat, index: usize, show_requests: bool) -> Vec<(Section, String, String)> {
     let turn = &c.turns[index];
     let mut sections = Vec::new();
     if c.turns.len() > 1 {
@@ -179,6 +203,16 @@ pub(crate) fn turn_sections(c: &Chat, index: usize) -> Vec<(Section, String, Str
         sections.push((Section::Turn, header, String::new()));
     }
     let request = turn_request_text(&c.turns, index);
+    let request = if show_requests {
+        request
+    } else {
+        match request_message_count(&c.turns, index) {
+            // A captured request collapses to its message count; an
+            // uncaptured one is already a short note on its own.
+            Some(count) => format!("(hidden: {count} messages — press t to show)"),
+            None => request,
+        }
+    };
     sections.push((Section::Request, "=== REQUEST ===".into(), request));
     let reasoning = turn.reasoning.clone();
     sections.push((Section::Reasoning, "=== REASONING ===".into(), reasoning));
@@ -194,7 +228,8 @@ pub(crate) fn turn_sections(c: &Chat, index: usize) -> Vec<(Section, String, Str
 pub(crate) fn render_chat(c: &Chat) -> String {
     let mut out = format!("{}\n\n", stats_text(c));
     for index in 0..c.turns.len() {
-        for (_, header, text) in turn_sections(c, index) {
+        // The dump keeps the full request even when the body hides it.
+        for (_, header, text) in turn_sections(c, index, true) {
             // Same line layout as body_section: header, text lines, blank.
             out.push_str(&header);
             out.push('\n');

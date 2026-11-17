@@ -7,8 +7,9 @@ use crate::text::{first_chars, format_duration, last_chars, middle_elide};
 use crate::transcript::{render_chat, stats_text, tool_calls_text};
 use crate::ui::TOOL_ORANGE;
 use crate::ui::body::{render_body, segment_anchor_rows};
+use crate::ui::status_bar;
 use crate::ui::tab_bar::build_tab_line;
-use crate::ui::timeline::timeline_body;
+use crate::ui::timeline::{keep_row_visible, timeline_body};
 use crate::wire::{
     Dir, Packet, classify, detect_backend, is_llm_response, looks_like_llm, thread_key_from_body,
     thread_key_from_headers, user_agent_from_headers,
@@ -144,7 +145,9 @@ fn detects_backend_from_response_markers() {
 fn tab_bar_shows_overflow_indicators_and_keeps_selected_visible() {
     let style = Style::default();
     let items: Vec<(String, Style)> = (0..6).map(|i| (format!(" tab{i} ● "), style)).collect();
-    let text = build_tab_line(&items, 3, 30).to_string();
+    let (line, hits) = build_tab_line(&items, 3, 30);
+    assert!(!hits.is_empty(), "visible tabs must report click targets");
+    let text = line.to_string();
     assert!(
         text.contains("tab3"),
         "selected tab must be visible: {text}"
@@ -156,9 +159,28 @@ fn tab_bar_shows_overflow_indicators_and_keeps_selected_visible() {
 fn tab_bar_fits_all_tabs_when_wide_enough() {
     let style = Style::default();
     let items: Vec<(String, Style)> = (0..3).map(|i| (format!(" t{i} ● "), style)).collect();
-    let text = build_tab_line(&items, 1, 200).to_string();
+    let (line, hits) = build_tab_line(&items, 1, 200);
+    assert_eq!(hits.len(), 3, "every visible tab must be clickable");
+    let text = line.to_string();
     assert!(text.contains("t0") && text.contains("t1") && text.contains("t2"));
     assert!(!text.contains("+"), "no overflow expected: {text}");
+}
+
+#[test]
+fn tab_bar_click_ranges_cover_each_visible_tab_in_order() {
+    let style = Style::default();
+    let items: Vec<(String, Style)> = (0..4).map(|i| (format!(" tab{i} ● "), style)).collect();
+    let (line, hits) = build_tab_line(&items, 1, 200);
+    let width = line.width();
+    assert_eq!(hits.len(), 4);
+    for (i, (start, end, index)) in hits.iter().enumerate() {
+        assert_eq!(*index, i, "hits map to the chat index in order");
+        assert!(*end > *start, "a tab has a non-empty range");
+        assert!(*start < width && *end <= width, "range must sit inside the line");
+        if i > 0 {
+            assert!(*start >= hits[i - 1].1, "ranges must not overlap");
+        }
+    }
 }
 
 #[test]
@@ -288,6 +310,47 @@ fn clean_done_clamps_the_selection() {
 
     assert!(app.chats.is_empty());
     assert_eq!(app.selected, 0);
+}
+
+#[test]
+fn next_running_jumps_to_the_next_live_chat_and_wraps() {
+    let mut app = App::new();
+    app.response(
+        "f1",
+        delta_response("done", json!({"content": "a"}), Some("stop")),
+    );
+    make_idle(&mut app, "done");
+    app.response(
+        "f2",
+        delta_response("live", json!({"content": "b"}), None),
+    );
+    app.response(
+        "f3",
+        delta_response("tools", json!({"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "bash"}}]}), Some("tool_calls")),
+    );
+    app.selected = 0;
+
+    app.next_running();
+    assert_eq!(app.chats[app.selected].id(), "live");
+    app.next_running();
+    assert_eq!(app.chats[app.selected].id(), "tools");
+    app.next_running();
+    assert_eq!(app.chats[app.selected].id(), "live", "must wrap around");
+}
+
+#[test]
+fn next_running_reports_when_no_chat_is_live() {
+    let mut app = App::new();
+    app.response(
+        "f1",
+        delta_response("done", json!({"content": "a"}), Some("stop")),
+    );
+    make_idle(&mut app, "done");
+
+    app.next_running();
+
+    assert_eq!(app.selected, 0, "selection must not move");
+    assert!(app.status.contains("no running"), "{}", app.status);
 }
 
 #[test]
@@ -1241,6 +1304,14 @@ fn timeline_underlines_the_active_entry_only() {
 }
 
 #[test]
+fn timeline_scroll_keeps_the_active_row_visible() {
+    assert_eq!(keep_row_visible(3, 10, 50), 0, "row near the top: no scroll");
+    assert_eq!(keep_row_visible(15, 10, 50), 6, "row past the window: pin it to the bottom");
+    assert_eq!(keep_row_visible(99, 10, 20), 20, "never scroll past the end");
+    assert_eq!(keep_row_visible(5, 0, 3), 3, "clamped by the content length");
+}
+
+#[test]
 fn formats_durations_compactly() {
     assert_eq!(format_duration(Duration::from_millis(350)), "350ms");
     assert_eq!(format_duration(Duration::from_secs(12)), "12s");
@@ -1285,4 +1356,90 @@ fn dump_and_body_share_one_layout() {
         body_lines,
         "the dump and the body panel must render the same layout"
     );
+}
+
+#[test]
+fn body_hides_requests_when_toggled_but_the_dump_keeps_them() {
+    let mut app = App::new();
+    app.packet(request_body(5000, first_request()));
+    app.packet(response_packet(
+        5000,
+        delta_response("c1", json!({"content": "the answer"}), Some("stop")),
+    ));
+    let chat = &mut app.chats[0];
+
+    chat.show_requests = false;
+    let hidden = render_body(chat).to_string();
+    assert!(
+        !hidden.contains("find the file"),
+        "the hidden request must not be rendered: {hidden}"
+    );
+    assert!(hidden.contains("press t to show"), "{hidden}");
+    assert!(
+        render_chat(chat).contains("find the file"),
+        "the dump must keep the full request"
+    );
+
+    chat.show_requests = true;
+    assert!(render_body(chat).to_string().contains("find the file"));
+}
+
+#[test]
+fn draw_renders_every_ui_state_without_panic() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    // One chat with a captured request, then exercise the render pass in
+    // every combination of the user-switchable states.
+    let mut app = App::new();
+    app.packet(request_body(5000, first_request()));
+    app.packet(response_packet(
+        5000,
+        delta_response("c1", json!({"content": "hello world"}), None),
+    ));
+    app.status = "a status message that is reasonably long for the bar".into();
+
+    for (width, height) in [(100u16, 30u16), (40u16, 10u16)] {
+        for help in [false, true] {
+            for follow in [false, true] {
+                for show_requests in [false, true] {
+                    app.help = help;
+                    app.chats[0].follow = follow;
+                    app.chats[0].show_requests = show_requests;
+                    app.chats[0].scroll = 3;
+                    app.chats[0].timeline_scroll = 2;
+                    let backend = TestBackend::new(width, height);
+                    let mut terminal = Terminal::new(backend).unwrap();
+                    terminal
+                        .draw(|f| crate::ui::draw(f, &mut app))
+                        .unwrap();
+                }
+            }
+        }
+        // The no-chat branch must render too.
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut empty = App::new();
+        terminal
+            .draw(|f| crate::ui::draw(f, &mut empty))
+            .unwrap();
+    }
+    // The rename editor replaces the status line.
+    app.rename = Some("my chat".into());
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+}
+
+#[test]
+fn status_line_shows_the_message_and_a_keys_hint() {
+    let mut app = App::new();
+    app.status = "captured abc".into();
+    let line = status_bar(&app, 100).to_string();
+    assert!(line.contains("captured abc"), "{line}");
+    assert!(line.contains("? keys"), "{line}");
+    app.help = true;
+    let help = status_bar(&app, 100).to_string();
+    assert!(help.contains("q quit"), "the help panel lists the keys: {help}");
+    assert!(!help.contains("captured abc"), "the help replaces the message");
 }

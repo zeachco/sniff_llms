@@ -5,6 +5,12 @@ use crate::ui::{Chat, DIM};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 
+/// The scroll that keeps `row` visible in a window of `visible` rows: the row
+/// sits at the window's bottom, unless the content ends before that.
+pub(crate) fn keep_row_visible(row: usize, visible: usize, max: u16) -> u16 {
+    (row + 1).saturating_sub(visible).min(max as usize) as u16
+}
+
 /// The left-hand column: one entry per generated run of thinking, answer or
 /// tool call, in generation order, with its estimated token count and actual
 /// wall-clock duration. `segments` maps each content row to the flat index of

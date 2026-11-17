@@ -52,6 +52,14 @@ pub(crate) struct App {
     pub(crate) status: String,
     pub(crate) auto_clean: AutoClean,
     pub(crate) rename: Option<String>,
+    /// The full keymap panel is shown instead of the status message.
+    pub(crate) help: bool,
+    /// Tab bar geometry for mouse events: the whole bar area and, per visible
+    /// tab, its absolute column range and chat index.
+    pub(crate) tab_area: Rect,
+    pub(crate) tab_hits: Vec<(u16, u16, usize)>,
+    /// Inner height of the body pane, so PgUp/PgDn page by one screen.
+    pub(crate) body_rows: usize,
     /// First-turn id of the chat marked as a manual group parent.
     pub(crate) group_mark: Option<String>,
     /// Last frame's panel geometry and the timeline/body anchors of the
@@ -75,6 +83,10 @@ impl App {
             status: "waiting for traffic".into(),
             auto_clean: AutoClean::Never,
             rename: None,
+            help: false,
+            tab_area: Rect::default(),
+            tab_hits: Vec::new(),
+            body_rows: 0,
             group_mark: None,
             timeline_area: Rect::default(),
             body_area: Rect::default(),

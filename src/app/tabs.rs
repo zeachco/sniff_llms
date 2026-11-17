@@ -121,6 +121,42 @@ impl App {
         }
         self.status = format!("merged {turns} turns into {target_id}");
     }
+    /// Jump to the next chat that is still running, wrapping around, so a busy
+    /// tab bar does not need a manual sweep for the one live conversation.
+    pub(crate) fn next_running(&mut self) {
+        let n = self.chats.len();
+        if n == 0 {
+            self.status = "no chats to jump to".into();
+            return;
+        }
+        let mut i = self.selected;
+        loop {
+            i = (i + 1) % n;
+            if self.chats[i].is_running() {
+                self.selected = i;
+                self.status = format!("jumped to running {}", self.chats[i].id());
+                return;
+            }
+            if i == self.selected {
+                self.status = "no running chats".into();
+                return;
+            }
+        }
+    }
+    /// Hide or show the request sections of the body pane; the dump always
+    /// keeps them, so nothing is lost by hiding.
+    pub(crate) fn toggle_requests(&mut self) {
+        let Some(c) = self.chats.get_mut(self.selected) else {
+            self.status = "no chat to change".into();
+            return;
+        };
+        c.show_requests = !c.show_requests;
+        self.status = if c.show_requests {
+            "requests shown".into()
+        } else {
+            "requests hidden".into()
+        };
+    }
     pub(crate) fn close(&mut self) {
         self.close_at(self.selected)
     }

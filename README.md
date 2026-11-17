@@ -88,20 +88,33 @@ dropping them. When a router backend leg wins a response id, request metadata
 from the mirrored client leg (including the declared thread id) is adopted
 without appending the stream twice.
 
-Keys: `Left/Right` switch chats, `Up/Down` scroll, `End` resumes following,
-`x` closes and forgets a chat, `X` closes every finished chat at once, `m`
-merges the selected chat into the previous one as a continuation, `g` marks the
-selected tab as a group parent (press it
-again on the child to attach it), `u` ungroups it, `d` writes
-`~/chat-id-{id}.log`, `a` cycles the auto-clean rule, `r` renames the current
-chat (`Enter` saves, `Esc` cancels, blank clears), `R` asks a local model for a
-short name, and `q` quits.
+Keys: `Left/Right` switch chats, `n` jumps to the next running chat, `Up/Down`
+scroll, `Home`/`PgUp`/`PgDn` jump to the top or page the body, `End` resumes
+following, `x` closes and forgets a chat, `X` closes every finished chat at
+once, `m` merges the selected chat into the previous one as a continuation,
+`g` marks the selected tab as a group parent (press it again on the child to
+attach it), `u` ungroups it, `t` hides or shows the request sections, `d`
+writes `~/chat-id-{id}.log`, `a` cycles the auto-clean rule, `r` renames the
+current chat (`Enter` saves, `Esc` cancels, blank clears), `R` asks a local
+model for a short name, `?` toggles the full keymap, and `q` quits. The
+bottom line shows the status message; the keymap is one `?` press away.
+Tabs are also selected by a click, the wheel scrolls the body or the timeline
+under the pointer, and a click on a timeline row jumps the body to that
+segment. When the body is scrolled away from the stream its title shows
+`paused` until `End` resumes following.
 
 The left column is a timeline of the selected chat: one entry per generated
 run of **thinking**, **answer**, or **tool** call, in generation order. Each
 entry shows its estimated token count (from characters) and the wall-clock time
 it took to generate. The active entry is marked and bold. Turn boundaries are
-shown when a chat has more than one turn.
+shown when a chat has more than one turn. The timeline follows the active
+entry while the body follows the stream, so the marker never leaves the pane;
+the wheel over the timeline scrolls it independently.
+
+The `t` key hides the `=== REQUEST ===` sections of the body pane behind a
+one-line summary (`(hidden: N messages — press t to show)`), so long system
+prompts stop burying the answer; the dump written by `d` always keeps the
+full request regardless.
 
 The sticky statistics panel shows the name (when set), model, completion
 state, packet count, flow, declared thread id, parent id (for a grouped
